@@ -6,7 +6,7 @@ object `ae3bc5fc18e89ab619cb035a0475f9b1335ce897`). The Git ancestry records tha
 base directly. Upstream licenses the source as MIT OR Apache-2.0; the
 unmodified `LICENSE-MIT` and `LICENSE-APACHE2` files remain authoritative.
 
-Woven carries six narrow private seams:
+Woven carries seven narrow private seams:
 
 1. The already allocated per-instance `properties_array_index` is copied into
    `GpuSpawnerParams` and the WGSL `Spawner`, then installed in the private
@@ -46,6 +46,13 @@ Woven carries six narrow private seams:
    described above; it is not a pipeline key. Property uploads and render
    binding updates therefore remain live while motion, age, and emission are
    paused on the existing emitter.
+7. `EffectComputeTimestampWrites` accepts one-frame, embedding-owned timestamp
+   intervals for Hanabi's init and update compute-pass descriptors and consumes
+   them before simulation so an old device interval cannot be reused.
+   `ParticleRenderBatch` marks Hanabi's temporary draw entities so Woven can
+   classify particle runs while preserving the existing sorted phase. Hanabi
+   does not allocate queries, resolve raw ticks, aggregate routes, or enforce
+   budgets, and descriptors remain uninstrumented when no interval is supplied.
 
 The branch also selectively adopts two post-tag correctness fixes without the
 intervening batching, storage, shader-layout, sorting, or feature rewrites:
@@ -57,10 +64,12 @@ intervening batching, storage, shader-layout, sorting, or feature rewrites:
 
 The copied `vfx_common.wgsl` mechanically normalizes its upstream CRLF line
 endings while adding the matching Spawner fields. That normalization has no
-semantic effect. The six seams and two fixes above are the complete intentional
+semantic effect. The seven seams and two fixes above are the complete intentional
 behavior/layout delta from upstream v0.19.0.
 
 These private seams can be removed once upstream exposes equivalent render
 property access, per-instance paused simulation, correct matrix property
 layout behavior, independent material-resource bindings, and observable
-device-pipeline prewarming.
+device-pipeline prewarming. The timing seam can be removed once upstream
+accepts embedding-owned descriptor intervals and exposes an equivalent
+semantic particle-draw classification.

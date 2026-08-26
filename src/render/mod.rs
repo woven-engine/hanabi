@@ -106,6 +106,90 @@ pub(crate) use sort::SortBindGroups;
 
 use self::batch::EffectBatch;
 
+/// One query-set interval reserved by an embedding renderer for a Hanabi
+/// compute pass.
+///
+/// Hanabi only attaches this interval to the matching pass descriptor. Query
+/// allocation, resolution, tick conversion, and aggregation remain owned by
+/// the embedding renderer.
+#[derive(Clone, Debug)]
+pub struct EffectTimestampInterval {
+    query_set: wgpu::QuerySet,
+    beginning_of_pass_write_index: u32,
+    end_of_pass_write_index: u32,
+}
+
+impl EffectTimestampInterval {
+    /// Create an interval from two slots in one timestamp query set.
+    pub fn new(
+        query_set: wgpu::QuerySet,
+        beginning_of_pass_write_index: u32,
+        end_of_pass_write_index: u32,
+    ) -> Self {
+        Self {
+            query_set,
+            beginning_of_pass_write_index,
+            end_of_pass_write_index,
+        }
+    }
+
+    fn writes(&self) -> wgpu::ComputePassTimestampWrites<'_> {
+        wgpu::ComputePassTimestampWrites {
+            query_set: &self.query_set,
+            beginning_of_pass_write_index: Some(self.beginning_of_pass_write_index),
+            end_of_pass_write_index: Some(self.end_of_pass_write_index),
+        }
+    }
+}
+
+/// One-frame descriptor intervals supplied by an embedding renderer for the
+/// Hanabi-owned particle init and update compute passes.
+///
+/// The intervals are consumed at the beginning of Hanabi simulation, so a
+/// skipped frame or device recreation cannot accidentally reuse an old query
+/// set. Leaving either interval absent preserves the ordinary uninstrumented
+/// pass descriptor.
+#[derive(Resource, Default)]
+pub struct EffectComputeTimestampWrites {
+    init: Option<EffectTimestampInterval>,
+    update: Option<EffectTimestampInterval>,
+}
+
+impl EffectComputeTimestampWrites {
+    /// Replace the intervals that Hanabi will consume during its next frame.
+    pub fn set(
+        &mut self,
+        init: Option<EffectTimestampInterval>,
+        update: Option<EffectTimestampInterval>,
+    ) {
+        self.init = init;
+        self.update = update;
+    }
+
+    /// Clear any intervals that have not yet been consumed.
+    pub fn clear(&mut self) {
+        self.init = None;
+        self.update = None;
+    }
+
+    fn take(
+        &mut self,
+    ) -> (
+        Option<EffectTimestampInterval>,
+        Option<EffectTimestampInterval>,
+    ) {
+        (self.init.take(), self.update.take())
+    }
+}
+
+/// Semantic marker attached to render-world entities that draw Hanabi
+/// particles.
+///
+/// Embedding renderers can use this marker to preserve sorted phase order while
+/// isolating particle draw runs from ordinary material work.
+#[derive(Component, Clone, Copy, Debug, Default)]
+pub struct ParticleRenderBatch;
+
 /// Plugin to add systems related to Hanabi rendering.
 #[derive(Debug, Clone, Copy)]
 pub struct HanabiRenderPlugin;
@@ -4825,6 +4909,7 @@ pub(crate) fn batch_effects(
                 translation,
                 main_entity: *main_entity,
             })
+            .insert(ParticleRenderBatch)
             .insert(TemporaryRenderEntity);
     }
 
@@ -7222,13 +7307,14 @@ fn begin_hanabi_compute_pass<'encoder>(
     label: &str,
     pipeline_cache: &'encoder PipelineCache,
     render_context: &'encoder mut RenderContext,
+    timestamp_interval: Option<&'encoder EffectTimestampInterval>,
 ) -> HanabiComputePass<'encoder> {
     let compute_pass =
         render_context
             .command_encoder()
             .begin_compute_pass(&ComputePassDescriptor {
                 label: Some(label),
-                timestamp_writes: None,
+                timestamp_writes: timestamp_interval.map(EffectTimestampInterval::writes),
             });
     HanabiComputePass::new(pipeline_cache, compute_pass)
 }
@@ -7246,8 +7332,13 @@ fn simulate(
     gpu_buffer_operations: Res<GpuBufferOperations>,
     sorted_effect_batches: Res<SortedEffectBatches>,
     init_fill_dispatch_queue: Res<InitFillDispatchQueue>,
+    timestamp_writes: Option<ResMut<EffectComputeTimestampWrites>>,
 ) {
     trace!("simulate()");
+
+    let (init_timestamp_interval, update_timestamp_interval) = timestamp_writes
+        .map(|mut writes| writes.take())
+        .unwrap_or_default();
 
     // Make sure to schedule any buffer copy before accessing their content later in
     // the GPU commands below.
@@ -7319,8 +7410,12 @@ fn simulate(
     {
         trace!("init: loop over effect batches...");
 
-        let mut compute_pass =
-            begin_hanabi_compute_pass("hanabi:init", &pipeline_cache, &mut render_context);
+        let mut compute_pass = begin_hanabi_compute_pass(
+            "hanabi:init",
+            &pipeline_cache,
+            &mut render_context,
+            init_timestamp_interval.as_ref(),
+        );
 
         // Bind group simparams@0 is common to everything, only set once per init pass
         compute_pass.set_bind_group(
@@ -7480,6 +7575,7 @@ fn simulate(
             "hanabi:indirect_dispatch",
             &pipeline_cache,
             &mut render_context,
+            None,
         );
 
         // Dispatch indirect dispatch compute job
@@ -7541,6 +7637,7 @@ fn simulate(
             "hanabi:update_prefix_sum",
             &pipeline_cache,
             &mut render_context,
+            None,
         );
 
         trace!("record commands for update prefix sum pipeline...");
@@ -7574,8 +7671,12 @@ fn simulate(
     // Simulate all alive particles.
     let mut needs_sort = false;
     {
-        let mut compute_pass =
-            begin_hanabi_compute_pass("hanabi:update", &pipeline_cache, &mut render_context);
+        let mut compute_pass = begin_hanabi_compute_pass(
+            "hanabi:update",
+            &pipeline_cache,
+            &mut render_context,
+            update_timestamp_interval.as_ref(),
+        );
 
         // Bind group simparams@0 is common to everything, only set once per update pass
         compute_pass.set_bind_group(
@@ -7693,6 +7794,7 @@ fn simulate(
                 "hanabi:sort_prefix_sum",
                 &pipeline_cache,
                 &mut render_context,
+                None,
             );
 
             trace!("record commands for sort prefix sum pass...");
@@ -7740,8 +7842,12 @@ fn simulate(
 
         // Compute sort pass
         {
-            let mut compute_pass =
-                begin_hanabi_compute_pass("hanabi:sort", &pipeline_cache, &mut render_context);
+            let mut compute_pass = begin_hanabi_compute_pass(
+                "hanabi:sort",
+                &pipeline_cache,
+                &mut render_context,
+                None,
+            );
 
             let effect_metadata_buffer = effects_meta.effect_metadata_buffer.buffer().unwrap();
             let indirect_buffer = sort_bind_groups.indirect_buffer().unwrap();
@@ -7939,6 +8045,52 @@ mod tests {
     fn layout_flags() {
         let flags = LayoutFlags::default();
         assert_eq!(flags, LayoutFlags::NONE);
+    }
+
+    #[test]
+    fn particle_render_batches_have_one_semantic_marker() {
+        let mut world = World::new();
+        let entity = world.spawn(ParticleRenderBatch).id();
+        assert!(world.entity(entity).contains::<ParticleRenderBatch>());
+    }
+
+    #[cfg(feature = "gpu_tests")]
+    #[test]
+    fn effect_timestamp_intervals_are_consumed_once() {
+        use crate::test_utils::MockRenderer;
+
+        let renderer = MockRenderer::new();
+        let query_set =
+            renderer
+                .device()
+                .wgpu_device()
+                .create_query_set(&wgpu::QuerySetDescriptor {
+                    // This test exercises only interval ownership and descriptor
+                    // construction. The mock device intentionally does not request
+                    // timestamp capability; Woven's physical suite supplies and
+                    // resolves real timestamp query sets.
+                    label: Some("hanabi-test-interval-storage"),
+                    ty: wgpu::QueryType::Occlusion,
+                    count: 4,
+                });
+        let mut supplied = EffectComputeTimestampWrites::default();
+        supplied.set(
+            Some(EffectTimestampInterval::new(query_set.clone(), 0, 1)),
+            Some(EffectTimestampInterval::new(query_set.clone(), 2, 3)),
+        );
+
+        let (init, update) = supplied.take();
+        let init = init.expect("init interval");
+        let update = update.expect("update interval");
+        let init_writes = init.writes();
+        let update_writes = update.writes();
+        assert_eq!(init_writes.query_set, &query_set);
+        assert_eq!(init_writes.beginning_of_pass_write_index, Some(0));
+        assert_eq!(init_writes.end_of_pass_write_index, Some(1));
+        assert_eq!(update_writes.query_set, &query_set);
+        assert_eq!(update_writes.beginning_of_pass_write_index, Some(2));
+        assert_eq!(update_writes.end_of_pass_write_index, Some(3));
+        assert!(matches!(supplied.take(), (None, None)));
     }
 
     #[cfg(feature = "gpu_tests")]
