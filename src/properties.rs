@@ -566,11 +566,27 @@ impl PropertyLayout {
         let properties = properties; // un-mut
 
         let mut layout = vec![];
-        let mut offset = 0;
+        let mut offset = 0_u32;
 
-        // Enqueue all Float4, which are already aligned
+        // Enqueue matrices first. Upstream's vector-only packing treated every
+        // value of 16 bytes or more as a single vec4 slot, which overlaps the
+        // following property for mat3/mat4 values. Matrix properties use their
+        // complete WGSL size and alignment while the established compact
+        // scalar/vector packing below remains unchanged.
+        let index_matrix = properties.partition_point(|prop| prop.size() <= 16);
+        for &prop in properties.iter().skip(index_matrix) {
+            offset = offset.next_multiple_of(prop.value_type().align() as u32);
+            let entry = PropertyLayoutEntry {
+                property: prop.clone(),
+                offset,
+            };
+            offset += prop.size() as u32;
+            layout.push(entry);
+        }
+
+        // Enqueue all Float4, which are already aligned.
         let index4 = properties.partition_point(|prop| prop.size() < 16);
-        for &prop in properties.iter().skip(index4) {
+        for &prop in &properties[index4..index_matrix] {
             let entry = PropertyLayoutEntry {
                 property: prop.clone(),
                 offset,
@@ -882,7 +898,7 @@ mod tests {
 
     use bevy::{
         ecs::change_detection::{MaybeLocation, Tick},
-        math::{Vec2, Vec3, Vec4},
+        math::{Mat3, Mat4, Vec2, Vec3, Vec4},
     };
 
     use super::*;
@@ -1040,6 +1056,32 @@ mod tests {
                 .to_string()
             )
         );
+    }
+
+    #[test]
+    fn layout_reserves_complete_matrix_values() {
+        let mat3 = Property::new("mat3", Value::Matrix(Mat3::IDENTITY.into()));
+        let mat4 = Property::new("mat4", Value::Matrix(Mat4::IDENTITY.into()));
+        let scalar = Property::new("scalar", 2.0_f32);
+        let layout = PropertyLayout::new([&mat3, &mat4, &scalar]);
+
+        assert_eq!(layout.cpu_size(), 116);
+        assert_eq!(layout.align(), 16);
+        assert_eq!(layout.min_binding_size(), NonZeroU64::new(128).unwrap());
+        let mut properties = layout.properties();
+        assert_eq!(properties.next(), Some((0, &mat3)));
+        assert_eq!(properties.next(), Some((48, &mat4)));
+        assert_eq!(properties.next(), Some((112, &scalar)));
+        assert_eq!(properties.next(), None);
+
+        let values = EffectProperties::default().with_properties([
+            ("mat3".to_owned(), Value::Matrix(Mat3::IDENTITY.into())),
+            ("mat4".to_owned(), Value::Matrix(Mat4::IDENTITY.into())),
+            ("scalar".to_owned(), 2.0_f32.into()),
+        ]);
+        let bytes = values.serialize(&layout);
+        assert_eq!(bytes.len(), 116);
+        assert_eq!(&bytes[112..116], &2.0_f32.to_ne_bytes());
     }
 
     // Regression test for #478

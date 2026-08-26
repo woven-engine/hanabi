@@ -581,6 +581,15 @@ impl From<&PropertyInstance> for PropertyValue {
 #[derive(Default, Clone, Copy, Component, ExtractComponent)]
 pub struct EffectVisibilityClass;
 
+/// Per-instance simulation pause state.
+///
+/// A paused effect remains renderable but neither initializes new particles
+/// nor advances existing particles. This is intentionally distinct from an
+/// inactive [`EffectSpawner`], which only suppresses emission.
+#[derive(Debug, Default, Clone, Copy, Component, Reflect)]
+#[reflect(Component)]
+pub struct EffectSimulationPaused(pub bool);
+
 /// Particle-based visual effect instance.
 ///
 /// The particle effect component represents a single instance of a visual
@@ -699,6 +708,60 @@ pub struct EffectMaterial {
     ///
     /// [slot index]: crate::TextureLayout::get_slot_by_name
     pub images: Vec<Handle<Image>>,
+    /// Portable sampler values for engine-owned named sampler slots.
+    ///
+    /// This private integration seam is ignored by ordinary Hanabi effects.
+    /// Woven uses it to keep sampler values as per-instance render data rather
+    /// than shader specialization.
+    pub woven_samplers: Vec<EffectSampler>,
+}
+
+/// Marks an engine-owned effect instance that exists only to prepare its
+/// device pipelines. It is specialized for active views but never submitted
+/// as a draw.
+#[derive(Debug, Default, Clone, Copy, Component)]
+pub struct EffectPipelinePrewarm;
+
+/// Device-observed state of every required pipeline for a particle effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectPipelineState {
+    /// At least one compute or render pipeline is still queued or creating.
+    Preparing,
+    /// Every observed compute and render pipeline is device-ready.
+    Ready,
+    /// At least one required pipeline was rejected by the device.
+    Failed,
+}
+
+/// Render-world pipeline readiness indexed by the source effect entity.
+#[derive(Debug, Default, Resource)]
+pub struct EffectPipelineStates {
+    states: std::collections::HashMap<Entity, EffectPipelineState>,
+}
+
+impl EffectPipelineStates {
+    /// Read the latest device-observed state for one source entity.
+    pub fn get(&self, entity: Entity) -> Option<EffectPipelineState> {
+        self.states.get(&entity).copied()
+    }
+}
+
+/// Per-instance sampler behavior for engine-owned named sampler slots.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EffectSampler {
+    /// Use the sampler stored with the texture at the same resource ordinal.
+    #[default]
+    Imported,
+    /// Nearest filtering with clamped coordinates.
+    NearestClamp,
+    /// Nearest filtering with repeated coordinates.
+    NearestRepeat,
+    /// Linear filtering with clamped coordinates.
+    LinearClamp,
+    /// Linear filtering with repeated coordinates.
+    LinearRepeat,
+    /// Linear filtering with mirrored coordinates.
+    LinearMirror,
 }
 
 /// Texture slot of a [`Module`].
@@ -724,6 +787,10 @@ pub struct TextureLayout {
     /// in [`EffectMaterial::images`] maps by index to a unique slot in this
     /// array.
     pub layout: Vec<TextureSlot>,
+    /// Engine-owned texture-only bindings appended after ordinary paired slots.
+    pub woven_textures: Vec<String>,
+    /// Engine-owned sampler-only bindings appended after texture-only bindings.
+    pub woven_samplers: Vec<String>,
 }
 
 impl TextureLayout {
@@ -734,6 +801,11 @@ impl TextureLayout {
     /// to it.
     pub fn get_slot_by_name(&self, name: &str) -> Option<usize> {
         self.layout.iter().position(|slot| slot.name == name)
+    }
+
+    /// Whether this layout declares no material resource bindings.
+    pub fn is_empty(&self) -> bool {
+        self.layout.is_empty() && self.woven_textures.is_empty() && self.woven_samplers.is_empty()
     }
 }
 
@@ -1208,6 +1280,18 @@ fn append_spawn_events_{0}(base_child_index: u32, particle_index: u32, count: u3
                 ));
                 bind_index += 2;
             }
+            for name in &texture_layout.woven_textures {
+                material_bindings_code.push_str(&format!(
+                    "@group(3) @binding({bind_index}) var {name}: texture_2d<f32>;\n"
+                ));
+                bind_index += 1;
+            }
+            for name in &texture_layout.woven_samplers {
+                material_bindings_code.push_str(&format!(
+                    "@group(3) @binding({bind_index}) var {name}: sampler;\n"
+                ));
+                bind_index += 1;
+            }
 
             (
                 render_context.vertex_code,
@@ -1365,6 +1449,8 @@ pub struct CompiledParticleEffect {
     effect_shader: Option<EffectShaders>,
     /// Textures used by the effect, if any.
     textures: Vec<Handle<Image>>,
+    /// Engine-owned sampler values used by named sampler-only slots.
+    woven_samplers: Vec<EffectSampler>,
     /// Layout flags.
     layout_flags: LayoutFlags,
     /// Alpha mode.
@@ -1387,6 +1473,7 @@ impl Default for CompiledParticleEffect {
             mesh: None,
             effect_shader: None,
             textures: vec![],
+            woven_samplers: vec![],
             layout_flags: LayoutFlags::NONE,
             alpha_mode: default(),
             parent_particle_layout: None,
@@ -1414,6 +1501,7 @@ impl CompiledParticleEffect {
         self.asset = Handle::default();
         self.effect_shader = None;
         self.textures.clear();
+        self.woven_samplers.clear();
     }
 
     /// Update the compiled effect from its asset and instance.
@@ -1540,6 +1628,9 @@ impl CompiledParticleEffect {
         }
 
         self.textures = material.map(|mat| &mat.images).cloned().unwrap_or_default();
+        self.woven_samplers = material
+            .map(|material| material.woven_samplers.clone())
+            .unwrap_or_default();
     }
 
     /// Get the effect shader if configured, or `None` otherwise.

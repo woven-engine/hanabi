@@ -101,6 +101,10 @@ pub(crate) struct EffectBatch {
     pub texture_layout: TextureLayout,
     /// Textures.
     pub textures: Vec<Handle<Image>>,
+    /// Engine-owned per-instance sampler values.
+    pub woven_samplers: Vec<crate::EffectSampler>,
+    /// Whether this batch exists only to specialize device pipelines.
+    pub pipeline_prewarm: bool,
     /// Alpha mode.
     pub alpha_mode: AlphaMode,
     /// Entities holding the source [`ParticleEffect`] instances which were
@@ -403,6 +407,8 @@ impl EffectBatch {
             mesh: cached_mesh.mesh,
             texture_layout: extracted_effect.texture_layout.clone(),
             textures: extracted_effect.textures.clone(),
+            woven_samplers: extracted_effect.woven_samplers.clone(),
+            pipeline_prewarm: extracted_effect.pipeline_prewarm,
             alpha_mode: extracted_effect.alpha_mode,
             entities: vec![main_entity.index_u32()],
             cached_effect_events: cached_effect_events.cloned(),

@@ -74,8 +74,9 @@ use crate::{
         batch::{BatchInput, EffectDrawBatch, EffectSorter, InitAndUpdatePipelineIds},
         effect_cache::{AnyDrawIndirectArgs, CachedDrawIndirectArgs, SlabId},
     },
-    AlphaMode, Attribute, CompiledParticleEffect, EffectProperties, EffectShaders,
-    EffectSimulation, EffectSpawner, EffectVisibilityClass, ParticleLayout, PropertyLayout,
+    AlphaMode, Attribute, CompiledParticleEffect, EffectPipelinePrewarm, EffectPipelineState,
+    EffectPipelineStates, EffectProperties, EffectSampler, EffectShaders, EffectSimulation,
+    EffectSimulationPaused, EffectSpawner, EffectVisibilityClass, ParticleLayout, PropertyLayout,
     SimulationCondition, TextureLayout,
 };
 
@@ -406,8 +407,15 @@ pub(crate) struct GpuSpawnerParams {
     /// effect's slab (if the effect has a parent effect), in number of
     /// particles (row index). This is ignored if the effect has no parent.
     parent_slab_offset: u32,
-    // For Pod
-    _padding0: u32,
+    /// Array index of this instance's property block. Render shaders cannot
+    /// bind effect metadata because it also backs indirect draws, so retain
+    /// the already allocated index in the per-instance spawner row.
+    properties_array_index: u32,
+    /// Nonzero when this instance must remain visible without advancing its
+    /// simulation or initializing particles.
+    simulation_paused: u32,
+    /// Explicit trailing padding required by the matrix-aligned shader layout.
+    simulation_padding: [u32; 3],
 }
 
 impl GpuSpawnerParams {
@@ -420,6 +428,8 @@ impl GpuSpawnerParams {
         parent_slab_offset: Option<u32>,
         effect_metadata_buffer_table_id: BufferTableId,
         maybe_cached_draw_indirect_args: Option<&CachedDrawIndirectArgs>,
+        maybe_cached_properties: Option<&CachedEffectProperties>,
+        simulation_paused: bool,
     ) -> Self {
         let transform = global_transform.to_matrix().into();
         let inverse_transform = Mat4::from(
@@ -439,6 +449,10 @@ impl GpuSpawnerParams {
                 .unwrap_or_default(),
             slab_offset,
             parent_slab_offset: parent_slab_offset.unwrap_or(u32::MAX),
+            properties_array_index: maybe_cached_properties
+                .map(|properties| properties.array_index)
+                .unwrap_or(u32::MAX),
+            simulation_paused: u32::from(simulation_paused),
             ..default()
         }
     }
@@ -1330,7 +1344,9 @@ impl GpuBufferOperations {
         );
 
         // Upload to GPU buffer
-        self.args_buffer.write_buffer(device, render_queue);
+        if self.args_buffer.write_buffer(device, render_queue) {
+            self.bind_groups.clear();
+        }
     }
 
     /// Create all necessary bind groups for all queued operations.
@@ -1929,13 +1945,14 @@ impl SpecializedComputePipeline for ParticlesUpdatePipeline {
 pub(crate) struct ParticlesRenderPipeline {
     view_layout_desc: BindGroupLayoutDescriptor,
     material_layout_descs: HashMap<TextureLayout, BindGroupLayoutDescriptor>,
+    woven_samplers: Vec<Sampler>,
 }
 
 impl ParticlesRenderPipeline {
     /// Cache a material, creating its bind group layout based on the texture
     /// layout.
     pub fn cache_material(&mut self, layout: &TextureLayout) {
-        if layout.layout.is_empty() {
+        if layout.is_empty() {
             return;
         }
 
@@ -1947,7 +1964,9 @@ impl ParticlesRenderPipeline {
             return;
         }
 
-        let mut entries = Vec::with_capacity(layout.layout.len() * 2);
+        let mut entries = Vec::with_capacity(
+            layout.layout.len() * 2 + layout.woven_textures.len() + layout.woven_samplers.len(),
+        );
         let mut index = 0;
         for _slot in &layout.layout {
             entries.push(BindGroupLayoutEntry {
@@ -1968,6 +1987,28 @@ impl ParticlesRenderPipeline {
             });
             index += 2;
         }
+        for _ in &layout.woven_textures {
+            entries.push(BindGroupLayoutEntry {
+                binding: index,
+                visibility: ShaderStages::VERTEX_FRAGMENT,
+                ty: BindingType::Texture {
+                    multisampled: false,
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D2,
+                },
+                count: None,
+            });
+            index += 1;
+        }
+        for _ in &layout.woven_samplers {
+            entries.push(BindGroupLayoutEntry {
+                binding: index,
+                visibility: ShaderStages::VERTEX_FRAGMENT,
+                ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                count: None,
+            });
+            index += 1;
+        }
         debug!(
             "Creating material bind group with {} entries [{:?}] for layout {:?}",
             entries.len(),
@@ -1983,16 +2024,32 @@ impl ParticlesRenderPipeline {
     /// Retrieve a bind group layout for a cached material.
     pub fn get_material(&self, layout: &TextureLayout) -> Option<&BindGroupLayoutDescriptor> {
         // Prevent a hash and lookup for the trivial case of an empty layout
-        if layout.layout.is_empty() {
+        if layout.is_empty() {
             return None;
         }
 
         self.material_layout_descs.get(layout)
     }
+
+    fn woven_sampler<'a>(
+        &'a self,
+        mode: EffectSampler,
+        imported: Option<&'a Sampler>,
+    ) -> &'a Sampler {
+        let index = match mode {
+            EffectSampler::Imported => return imported.unwrap_or(&self.woven_samplers[2]),
+            EffectSampler::NearestClamp => 0,
+            EffectSampler::NearestRepeat => 1,
+            EffectSampler::LinearClamp => 2,
+            EffectSampler::LinearRepeat => 3,
+            EffectSampler::LinearMirror => 4,
+        };
+        &self.woven_samplers[index]
+    }
 }
 
 impl FromWorld for ParticlesRenderPipeline {
-    fn from_world(_world: &mut World) -> Self {
+    fn from_world(world: &mut World) -> Self {
         let view_layout_desc = BindGroupLayoutDescriptor::new(
             "hanabi:bgl:render:view@0",
             &BindGroupLayoutEntries::sequential(
@@ -2006,9 +2063,36 @@ impl FromWorld for ParticlesRenderPipeline {
             ),
         );
 
+        let device = world.resource::<RenderDevice>();
+        let woven_samplers = [
+            (FilterMode::Nearest, AddressMode::ClampToEdge),
+            (FilterMode::Nearest, AddressMode::Repeat),
+            (FilterMode::Linear, AddressMode::ClampToEdge),
+            (FilterMode::Linear, AddressMode::Repeat),
+            (FilterMode::Linear, AddressMode::MirrorRepeat),
+        ]
+        .into_iter()
+        .map(|(filter, address)| {
+            device.create_sampler(&SamplerDescriptor {
+                label: Some("hanabi woven particle sampler"),
+                address_mode_u: address,
+                address_mode_v: address,
+                address_mode_w: address,
+                mag_filter: filter,
+                min_filter: filter,
+                mipmap_filter: if filter == FilterMode::Nearest {
+                    MipmapFilterMode::Nearest
+                } else {
+                    MipmapFilterMode::Linear
+                },
+                ..default()
+            })
+        })
+        .collect();
         Self {
             view_layout_desc,
             material_layout_descs: default(),
+            woven_samplers,
         }
     }
 }
@@ -2282,12 +2366,16 @@ pub(crate) struct ExtractedEffect {
     pub texture_layout: TextureLayout,
     /// Textures.
     pub textures: Vec<Handle<Image>>,
+    /// Engine-owned per-instance sampler values.
+    pub woven_samplers: Vec<EffectSampler>,
     /// Alpha mode.
     pub alpha_mode: AlphaMode,
     /// Effect shaders.
     pub effect_shaders: EffectShaders,
     /// Condition under which the effect is simulated.
     pub simulation_condition: SimulationCondition,
+    /// Whether this instance only exists to prepare device pipelines.
+    pub pipeline_prewarm: bool,
 }
 
 /// Extracted data for the [`GpuSpawnerParams`].
@@ -2308,6 +2396,13 @@ pub(crate) struct ExtractedSpawner {
     pub transform: GlobalTransform,
     /// Is the effect visible this frame?
     pub is_visible: bool,
+    /// Whether this effect remains rendered but does not simulate.
+    pub simulation_paused: bool,
+}
+
+#[derive(Resource, Default)]
+pub(crate) struct QueuedEffectRenderPipelines {
+    by_entity: HashMap<Entity, Vec<CachedRenderPipelineId>>,
 }
 
 /// Cache info for the metadata of the effect.
@@ -2574,6 +2669,8 @@ pub(crate) fn extract_effects(
             &CompiledParticleEffect,
             Option<Ref<EffectProperties>>,
             &GlobalTransform,
+            Option<&EffectSimulationPaused>,
+            Option<&EffectPipelinePrewarm>,
         )>,
     >,
     // Render world effects extracted from a previous frame, if any
@@ -2600,6 +2697,8 @@ pub(crate) fn extract_effects(
         compiled_effect,
         maybe_properties,
         transform,
+        simulation_paused,
+        pipeline_prewarm,
     ) in q_effects.iter()
     {
         // Check if shaders are configured
@@ -2662,9 +2761,11 @@ pub(crate) fn extract_effects(
             layout_flags,
             texture_layout,
             textures: compiled_effect.textures.clone(),
+            woven_samplers: compiled_effect.woven_samplers.clone(),
             alpha_mode,
             effect_shaders: effect_shaders.clone(),
             simulation_condition: asset.simulation_condition,
+            pipeline_prewarm: pipeline_prewarm.is_some(),
         };
         if let Some(mut extracted_effect) = maybe_extracted_effect {
             extracted_effect.set_if_neq(new_extracted_effect);
@@ -2682,6 +2783,7 @@ pub(crate) fn extract_effects(
             prng_seed: compiled_effect.prng_seed,
             transform: *transform,
             is_visible,
+            simulation_paused: simulation_paused.is_some_and(|paused| paused.0),
         };
         trace!(
             "[Effect {}] spawn_count={} prng_seed={}",
@@ -2717,7 +2819,7 @@ pub(crate) fn extract_effects(
 
         // Extract the parent, if any, and resolve its render entity
         let parent_render_entity = if let Some(main_entity) = compiled_effect.parent {
-            let Ok((_, render_entity, _, _, _, _, _, _)) = q_effects.get(main_entity) else {
+            let Ok((_, render_entity, _, _, _, _, _, _, _, _)) = q_effects.get(main_entity) else {
                 error!(
                     "Failed to resolve render entity of parent with main entity {:?}.",
                     main_entity
@@ -3152,17 +3254,9 @@ impl Default for LayoutFlags {
 /// indicates that the effect instance was despawned.
 pub(crate) fn on_remove_cached_effect(
     trigger: On<Remove, CachedEffect>,
-    query: Query<(
-        Entity,
-        &MainEntity,
-        &CachedEffect,
-        Option<&CachedEffectProperties>,
-        Option<&CachedParentInfo>,
-        Option<&CachedEffectEvents>,
-    )>,
+    query: Query<(Entity, &MainEntity, &CachedEffect)>,
     mut effect_cache: ResMut<EffectCache>,
     mut effect_bind_groups: ResMut<EffectBindGroups>,
-    mut event_cache: ResMut<EventCache>,
 ) {
     #[cfg(feature = "trace")]
     let _span = bevy::log::info_span!("on_remove_cached_effect").entered();
@@ -3172,33 +3266,9 @@ pub(crate) fn on_remove_cached_effect(
 
     // Fecth the components of the effect being destroyed. Note that the despawn
     // command above is not yet applied, so this query should always succeed.
-    let Ok((
-        render_entity,
-        main_entity,
-        cached_effect,
-        _opt_props,
-        _opt_parent,
-        opt_cached_effect_events,
-    )) = query.get(trigger.event().entity)
-    else {
+    let Ok((render_entity, main_entity, cached_effect)) = query.get(trigger.event().entity) else {
         return;
     };
-
-    // Dealllocate the effect slice in the event buffer, if any.
-    if let Some(cached_effect_events) = opt_cached_effect_events {
-        match event_cache.free(cached_effect_events) {
-            Err(err) => {
-                error!("Error while freeing effect event slice: {err:?}");
-            }
-            Ok(buffer_state) => {
-                if buffer_state != SlabState::Used {
-                    // Clear bind groups associated with the old buffer
-                    effect_bind_groups.init_metadata_bind_groups.clear();
-                    effect_bind_groups.update_metadata_bind_groups.clear();
-                }
-            }
-        }
-    }
 
     // Deallocate the effect slice in the GPU effect buffer, and if this was the
     // last slice, also deallocate the GPU buffer itself.
@@ -3362,20 +3432,29 @@ pub fn allocate_effects(
     trace!("allocate_effects");
 
     for (entity, extracted_effect, has_parent, maybe_cached_effect) in &mut q_extracted_effects {
+        // Pipeline-only instances need the real particle/property/layout keys,
+        // but never simulate or draw. Allocate one element so device prewarm
+        // does not duplicate the authored emitter capacity while still using
+        // the ordinary engine-owned cache lifetime.
+        let allocation_capacity = if extracted_effect.pipeline_prewarm {
+            1
+        } else {
+            extracted_effect.capacity
+        };
         // Insert or update the effect into the EffectCache
         if let Some(mut cached_effect) = maybe_cached_effect {
             trace!("Updating EffectCache entry for entity {entity:?}...");
             let _ = effect_cache.remove(cached_effect.as_ref());
             *cached_effect = effect_cache.insert(
                 extracted_effect.handle.clone(),
-                extracted_effect.capacity,
+                allocation_capacity,
                 &extracted_effect.particle_layout,
             );
         } else {
             trace!("Allocating new entry in EffectCache for entity {entity:?}...");
             let cached_effect = effect_cache.insert(
                 extracted_effect.handle.clone(),
-                extracted_effect.capacity,
+                allocation_capacity,
                 &extracted_effect.particle_layout,
             );
             commands.entity(entity).insert(cached_effect);
@@ -4382,6 +4461,7 @@ pub(crate) fn prepare_batch_inputs(
         Option<&ChildEffectOf>,
         Option<&CachedChildInfo>,
         Option<&CachedEffectEvents>,
+        Option<&CachedEffectProperties>,
     )>,
     mut sort_bind_groups: ResMut<SortBindGroups>,
 ) {
@@ -4414,6 +4494,7 @@ pub(crate) fn prepare_batch_inputs(
         maybe_child_effect_of,
         maybe_cached_child_info,
         maybe_cached_effect_events,
+        maybe_cached_properties,
     ) in &q_cached_effects
     {
         extracted_effect_count += 1;
@@ -4452,7 +4533,7 @@ pub(crate) fn prepare_batch_inputs(
         // Fetch the bind group layouts from the cache
         trace!("child_effect_of={:?}", maybe_child_effect_of);
         let parent_slab_id = if let Some(child_effect_of) = maybe_child_effect_of {
-            let Ok((_, _, _, _, parent_cached_effect, _, _, _, _, _, _, _, _)) =
+            let Ok((_, _, _, _, parent_cached_effect, _, _, _, _, _, _, _, _, _)) =
                 q_cached_effects.get(child_effect_of.parent)
             else {
                 // At this point we should have discarded invalid effects with a missing parent,
@@ -4521,6 +4602,8 @@ pub(crate) fn prepare_batch_inputs(
             parent_slab_offset,
             cached_effect_metadata.table_id,
             maybe_cached_draw_indirect_args,
+            maybe_cached_properties,
+            extracted_spawner.simulation_paused,
         );
 
         trace!("Updating cached effect at entity {render_entity:?}...");
@@ -4841,6 +4924,7 @@ pub(crate) struct BufferBindGroups {
 struct Material {
     layout: TextureLayout,
     textures: Vec<AssetId<Image>>,
+    woven_samplers: Vec<EffectSampler>,
 }
 
 impl Material {
@@ -4848,37 +4932,55 @@ impl Material {
     pub fn make_entries<'a>(
         &self,
         gpu_images: &'a RenderAssets<GpuImage>,
+        render_pipeline: &'a ParticlesRenderPipeline,
     ) -> Result<Vec<BindGroupEntry<'a>>, ()> {
-        if self.textures.is_empty() {
+        if self.layout.is_empty() {
             return Ok(vec![]);
         }
-
-        let entries: Vec<BindGroupEntry<'a>> = self
-            .textures
-            .iter()
-            .enumerate()
-            .flat_map(|(index, id)| {
-                let base_binding = index as u32 * 2;
-                if let Some(gpu_image) = gpu_images.get(*id) {
-                    vec![
-                        BindGroupEntry {
-                            binding: base_binding,
-                            resource: BindingResource::TextureView(&gpu_image.texture_view),
-                        },
-                        BindGroupEntry {
-                            binding: base_binding + 1,
-                            resource: BindingResource::Sampler(&gpu_image.sampler),
-                        },
-                    ]
-                } else {
-                    vec![]
-                }
-            })
-            .collect();
-        if entries.len() == self.textures.len() * 2 {
-            return Ok(entries);
+        let ordinary_count = self.layout.layout.len();
+        let texture_count = self.layout.woven_textures.len();
+        if self.textures.len() != ordinary_count + texture_count
+            || self.woven_samplers.len() != self.layout.woven_samplers.len()
+        {
+            return Err(());
         }
-        Err(())
+        let mut entries =
+            Vec::with_capacity(ordinary_count * 2 + texture_count + self.woven_samplers.len());
+        let mut binding = 0_u32;
+        for id in self.textures.iter().take(ordinary_count) {
+            let image = gpu_images.get(*id).ok_or(())?;
+            entries.push(BindGroupEntry {
+                binding,
+                resource: BindingResource::TextureView(&image.texture_view),
+            });
+            entries.push(BindGroupEntry {
+                binding: binding + 1,
+                resource: BindingResource::Sampler(&image.sampler),
+            });
+            binding += 2;
+        }
+        for id in self.textures.iter().skip(ordinary_count) {
+            let image = gpu_images.get(*id).ok_or(())?;
+            entries.push(BindGroupEntry {
+                binding,
+                resource: BindingResource::TextureView(&image.texture_view),
+            });
+            binding += 1;
+        }
+        for (index, mode) in self.woven_samplers.iter().copied().enumerate() {
+            let imported = self
+                .textures
+                .get(ordinary_count + index)
+                .or_else(|| self.textures.get(index))
+                .and_then(|id| gpu_images.get(*id))
+                .map(|image| &image.sampler);
+            entries.push(BindGroupEntry {
+                binding,
+                resource: BindingResource::Sampler(render_pipeline.woven_sampler(mode, imported)),
+            });
+            binding += 1;
+        }
+        Ok(entries)
     }
 }
 
@@ -5268,6 +5370,7 @@ fn emit_sorted_draw<T, F>(
     property_cache: &PropertyCache,
     render_meshes: &RenderAssets<RenderMesh>,
     pipeline_cache: &PipelineCache,
+    queued_pipelines: &mut QueuedEffectRenderPipelines,
     make_phase_item: F,
     #[cfg(all(feature = "2d", feature = "3d"))] pipeline_mode: PipelineMode,
 ) where
@@ -5344,10 +5447,11 @@ fn emit_sorted_draw<T, F>(
             // TODO - Profile to confirm.
             #[cfg(feature = "trace")]
             let _span_check_vis = bevy::log::info_span!("check_visibility").entered();
-            let has_visible_entity = effect_batch
-                .entities
-                .iter()
-                .any(|index| view_entities.contains(*index as usize));
+            let has_visible_entity = effect_batch.pipeline_prewarm
+                || effect_batch
+                    .entities
+                    .iter()
+                    .any(|index| view_entities.contains(*index as usize));
             if !has_visible_entity {
                 trace!("No visible entity for view, not emitting any draw call.");
                 continue;
@@ -5443,6 +5547,11 @@ fn emit_sorted_draw<T, F>(
             _span_specialize.exit();
 
             trace!("+ Render pipeline specialized: id={:?}", render_pipeline_id,);
+            queued_pipelines
+                .by_entity
+                .entry(draw_batch.main_entity.id())
+                .or_default()
+                .push(render_pipeline_id);
             trace!(
                 "+ Add Transparent for batch on draw_entity {:?}: slab_id={} \
                 spawner_base={} handle={:?}",
@@ -5451,6 +5560,9 @@ fn emit_sorted_draw<T, F>(
                 effect_batch.spawner_base,
                 effect_batch.handle
             );
+            if effect_batch.pipeline_prewarm {
+                continue;
+            }
             render_phase.add_transient(make_phase_item(
                 render_pipeline_id,
                 (draw_entity, draw_batch.main_entity),
@@ -5474,6 +5586,7 @@ fn emit_binned_draw<T, F, G>(
     pipeline_cache: &PipelineCache,
     render_meshes: &RenderAssets<RenderMesh>,
     mesh_allocator: &MeshAllocator,
+    queued_pipelines: &mut QueuedEffectRenderPipelines,
     make_batch_set_key: F,
     make_bin_key: G,
     #[cfg(all(feature = "2d", feature = "3d"))] pipeline_mode: PipelineMode,
@@ -5552,10 +5665,11 @@ fn emit_binned_draw<T, F, G>(
             // TODO - Profile to confirm.
             #[cfg(feature = "trace")]
             let _span_check_vis = bevy::log::info_span!("check_visibility").entered();
-            let has_visible_entity = effect_batch
-                .entities
-                .iter()
-                .any(|index| view_entities.contains(*index as usize));
+            let has_visible_entity = effect_batch.pipeline_prewarm
+                || effect_batch
+                    .entities
+                    .iter()
+                    .any(|index| view_entities.contains(*index as usize));
             if !has_visible_entity {
                 trace!("No visible entity for view, not emitting any draw call.");
                 continue;
@@ -5649,6 +5763,11 @@ fn emit_binned_draw<T, F, G>(
             _span_specialize.exit();
 
             trace!("+ Render pipeline specialized: id={:?}", render_pipeline_id,);
+            queued_pipelines
+                .by_entity
+                .entry(draw_batch.main_entity.id())
+                .or_default()
+                .push(render_pipeline_id);
             trace!(
                 "+ Add Transparent for batch on draw_entity {:?}: slab_id={} \
                 spawner_base={} handle={:?}",
@@ -5660,6 +5779,9 @@ fn emit_binned_draw<T, F, G>(
             let slabs = mesh_allocator
                 .mesh_slabs(&effect_batch.mesh)
                 .unwrap_or_default();
+            if effect_batch.pipeline_prewarm {
+                continue;
+            }
             render_phase.add(
                 make_batch_set_key(render_pipeline_id, draw_batch, view, slabs),
                 make_bin_key(),
@@ -5677,6 +5799,7 @@ pub(crate) fn queue_effects(
     mut render_pipeline: ResMut<ParticlesRenderPipeline>,
     mut specialized_render_pipelines: ResMut<SpecializedRenderPipelines<ParticlesRenderPipeline>>,
     mut effect_bind_groups: ResMut<EffectBindGroups>,
+    mut queued_pipelines: ResMut<QueuedEffectRenderPipelines>,
     sorted_effect_batches: Res<SortedEffectBatches>,
     effect_draw_batches: Query<(Entity, &mut EffectDrawBatch)>,
     events: Res<EffectAssetEvents>,
@@ -5700,6 +5823,7 @@ pub(crate) fn queue_effects(
     let _span = bevy::log::info_span!("hanabi:queue_effects").entered();
 
     trace!("queue_effects");
+    queued_pipelines.by_entity.clear();
 
     let effects_meta = read_params.effects_meta.into_inner();
     let property_cache = read_params.property_cache.into_inner();
@@ -5761,6 +5885,7 @@ pub(crate) fn queue_effects(
                 property_cache,
                 &render_meshes,
                 pipeline_cache,
+                &mut queued_pipelines,
                 |id, entity, draw_batch, _view| Transparent2d {
                     sort_key: FloatOrd(draw_batch.translation.z),
                     entity,
@@ -5806,6 +5931,7 @@ pub(crate) fn queue_effects(
                 property_cache,
                 &render_meshes,
                 pipeline_cache,
+                &mut queued_pipelines,
                 |id, entity, batch, view| Transparent3d {
                     sorting_info: TransparentSortingInfo3d::Sorted {
                         mesh_center: batch.translation,
@@ -5849,6 +5975,7 @@ pub(crate) fn queue_effects(
                 pipeline_cache,
                 &render_meshes,
                 &mesh_allocator,
+                &mut queued_pipelines,
                 |id, _batch, _view, slabs| OpaqueNoLightmap3dBatchSetKey {
                     pipeline: id,
                     draw_function: draw_effects_function_alpha_mask,
@@ -5890,6 +6017,7 @@ pub(crate) fn queue_effects(
                 pipeline_cache,
                 &render_meshes,
                 &mesh_allocator,
+                &mut queued_pipelines,
                 |id, _batch, _view, slabs| Opaque3dBatchSetKey {
                     pipeline: id,
                     draw_function: draw_effects_function_opaque,
@@ -5906,6 +6034,59 @@ pub(crate) fn queue_effects(
                 ParticleRenderAlphaMaskPipelineKey::Opaque,
             );
         }
+    }
+}
+
+/// Publish truthful compute-and-render pipeline readiness for engine-owned
+/// prewarm and live instances after every view variant has been queued.
+pub(crate) fn update_effect_pipeline_states(
+    effects: Query<(&MainEntity, &CachedPipelines)>,
+    queued: Res<QueuedEffectRenderPipelines>,
+    pipeline_cache: Res<PipelineCache>,
+    mut states: ResMut<EffectPipelineStates>,
+) {
+    states.states.clear();
+    for (main_entity, cached) in &effects {
+        let mut preparing = false;
+        let mut failed = false;
+        for pipeline in [cached.init, cached.update] {
+            let Some(pipeline) = pipeline else {
+                preparing = true;
+                continue;
+            };
+            match pipeline_cache.get_compute_pipeline_state(pipeline) {
+                CachedPipelineState::Ok(_) => {}
+                CachedPipelineState::Queued | CachedPipelineState::Creating(_) => {
+                    preparing = true;
+                }
+                CachedPipelineState::Err(_) => failed = true,
+            }
+        }
+        let render_pipelines = queued.by_entity.get(&main_entity.id());
+        if render_pipelines.is_none_or(Vec::is_empty) {
+            preparing = true;
+        }
+        if let Some(render_pipelines) = render_pipelines {
+            for pipeline in render_pipelines {
+                match pipeline_cache.get_render_pipeline_state(*pipeline) {
+                    CachedPipelineState::Ok(_) => {}
+                    CachedPipelineState::Queued | CachedPipelineState::Creating(_) => {
+                        preparing = true;
+                    }
+                    CachedPipelineState::Err(_) => failed = true,
+                }
+            }
+        }
+        states.states.insert(
+            main_entity.id(),
+            if failed {
+                EffectPipelineState::Failed
+            } else if preparing {
+                EffectPipelineState::Preparing
+            } else {
+                EffectPipelineState::Ready
+            },
+        );
     }
 }
 
@@ -6642,7 +6823,7 @@ pub(crate) fn prepare_bind_groups(
         // Ensure the particle texture(s) are available as GPU resources and that a bind
         // group for them exists
         // FIXME fix this insert+get below
-        if !effect_batch.texture_layout.layout.is_empty() {
+        if !effect_batch.texture_layout.is_empty() {
             // This should always be available, as this is cached into the render pipeline
             // just before we start specializing it.
             let Some(material_bind_group_layout_desc) =
@@ -6659,11 +6840,15 @@ pub(crate) fn prepare_bind_groups(
             let material = Material {
                 layout: effect_batch.texture_layout.clone(),
                 textures: effect_batch.textures.iter().map(|h| h.id()).collect(),
+                woven_samplers: effect_batch.woven_samplers.clone(),
             };
-            assert_eq!(material.layout.layout.len(), material.textures.len());
+            assert_eq!(
+                material.layout.layout.len() + material.layout.woven_textures.len(),
+                material.textures.len()
+            );
 
             //let bind_group_entries = material.make_entries(&gpu_images).unwrap();
-            let Ok(bind_group_entries) = material.make_entries(&gpu_images) else {
+            let Ok(bind_group_entries) = material.make_entries(&gpu_images, render_pipeline) else {
                 trace!(
                     "Temporarily ignoring material {:?} due to missing image(s)",
                     material
@@ -6680,6 +6865,8 @@ pub(crate) fn prepare_bind_groups(
                         &format!(
                             "hanabi:material_bind_group_{}",
                             material.layout.layout.len()
+                                + material.layout.woven_textures.len()
+                                + material.layout.woven_samplers.len()
                         )[..],
                         &pipeline_cache.get_bind_group_layout(material_bind_group_layout_desc),
                         &bind_group_entries[..],
@@ -6802,8 +6989,9 @@ fn draw<'w>(
     let material = Material {
         layout: effect_batch.texture_layout.clone(),
         textures: effect_batch.textures.iter().map(|h| h.id()).collect(),
+        woven_samplers: effect_batch.woven_samplers.clone(),
     };
-    if !effect_batch.texture_layout.layout.is_empty() {
+    if !effect_batch.texture_layout.is_empty() {
         if let Some(bind_group) = effect_bind_groups.material_bind_groups.get(&material) {
             pass.set_bind_group(3, bind_group, &[]);
         } else {

@@ -495,6 +495,23 @@ impl Module {
         }
     }
 
+    /// Add an engine-owned named texture-only render binding.
+    ///
+    /// Unlike [`Self::add_texture_slot`], this binding is consumed by custom
+    /// render WGSL and does not create a Hanabi expression handle.
+    pub fn add_woven_texture_binding(&mut self, name: impl Into<String>) {
+        let name = name.into();
+        assert!(!self.texture_layout.woven_textures.contains(&name));
+        self.texture_layout.woven_textures.push(name);
+    }
+
+    /// Add an engine-owned named sampler-only render binding.
+    pub fn add_woven_sampler_binding(&mut self, name: impl Into<String>) {
+        let name = name.into();
+        assert!(!self.texture_layout.woven_samplers.contains(&name));
+        self.texture_layout.woven_samplers.push(name);
+    }
+
     /// Insert into the given set all attributes referenced by any
     /// [`AttributeExpr`] present in the module.
     ///

@@ -131,6 +131,15 @@ fn main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
         .rows[slab_particle_index]
         .particle_index[read_index];
 
+    // A paused effect must keep its existing particles visible while leaving
+    // all particle state untouched. Copy the alive indirection entry into the
+    // current render side of the ping-pong buffer and skip age/modifier work.
+    if ((*spawner).simulation_paused != 0u) {
+        let indirect_index = atomicAdd(&draw_indirect_buffer[(*effect_metadata).indirect_render_index].instance_count, 1u);
+        indirect_buffer.rows[base_particle + indirect_index].particle_index[write_index] = particle_index;
+        return;
+    }
+
 #ifdef READ_PARENT_PARTICLE
     let parent_base_particle = (*spawner).parent_slab_offset;
 #endif

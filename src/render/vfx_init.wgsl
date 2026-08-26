@@ -111,6 +111,10 @@ fn main(@builtin(global_invocation_id) global_invocation_id: vec3<u32>) {
     effect_metadata_index = (*spawner).effect_metadata_index;
     let base_particle = location.base_particle;
 
+    if ((*spawner).simulation_paused != 0u) {
+        return;
+    }
+
     // Cap to max number of dead particles, copied from (capacity - alive_count) at the end
     // of the previous iteration, and constant during this pass (unlike alive_count).
     let effect_metadata = &effect_metadatas[(*spawner).effect_metadata_index];

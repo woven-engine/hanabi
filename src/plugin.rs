@@ -37,13 +37,14 @@ use crate::{
         prepare_indirect_pipeline, prepare_init_update_pipelines, prepare_property_buffers,
         propagate_ready_state, queue_effects, queue_init_fill_dispatch_ops,
         queue_init_indirect_workgroup_update, queue_sort_fill_dispatch_ops, report_ready_state,
-        start_stop_gpu_debug_capture, update_mesh_locations, DebugSettings,
-        DispatchIndirectPipeline, DrawEffects, EffectAssetEvents, EffectBindGroups, EffectCache,
-        EffectsMeta, EventCache, GpuBatchInfo, GpuBufferOperations, GpuEffectMetadata,
+        start_stop_gpu_debug_capture, update_effect_pipeline_states, update_mesh_locations,
+        DebugSettings, DispatchIndirectPipeline, DrawEffects, EffectAssetEvents, EffectBindGroups,
+        EffectCache, EffectsMeta, EventCache, GpuBatchInfo, GpuBufferOperations, GpuEffectMetadata,
         GpuSpawnerParams, HanabiRenderPlugin, InitFillDispatchQueue, ParticlesInitPipeline,
         ParticlesRenderPipeline, ParticlesUpdatePipeline, PrefixSumPipeline, PropertyBindGroups,
-        PropertyCache, RenderDebugSettings, ShaderCache, SimParams, SortBindGroups,
-        SortFillDispatchQueue, SortedEffectBatches, StorageType as _, UtilsPipeline,
+        PropertyCache, QueuedEffectRenderPipelines, RenderDebugSettings, ShaderCache, SimParams,
+        SortBindGroups, SortFillDispatchQueue, SortedEffectBatches, StorageType as _,
+        UtilsPipeline,
     },
     spawn::{self, Random},
     tick_spawners,
@@ -392,6 +393,8 @@ impl Plugin for HanabiPlugin {
             .init_resource::<ParticlesRenderPipeline>()
             .init_resource::<SpecializedRenderPipelines<ParticlesRenderPipeline>>()
             .init_resource::<EffectAssetEvents>()
+            .init_resource::<QueuedEffectRenderPipelines>()
+            .init_resource::<crate::EffectPipelineStates>()
             .init_resource::<SimParams>()
             .init_resource::<SortedEffectBatches>()
             .configure_sets(
@@ -485,6 +488,9 @@ impl Plugin for HanabiPlugin {
                     queue_effects
                         .in_set(EffectSystems::QueueEffects)
                         .after(batch_effects),
+                    update_effect_pipeline_states
+                        .in_set(EffectSystems::QueueEffects)
+                        .after(queue_effects),
                     // Queue the dispatch ops to fill the indirect dispatch args of the init pass
                     // of child effects.
                     queue_init_indirect_workgroup_update

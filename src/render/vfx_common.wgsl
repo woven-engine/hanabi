@@ -49,9 +49,13 @@ struct Spawner {
     /// This is ignored if the effect has no parent.
     parent_slab_offset: u32,
 
-    // Keep this field here separate from auto-padding below, so that the WGSL and Rust
-    // struct definitions match.
-    unused: u32,
+    /// Per-instance row in the property array bound for this batch. Keeping
+    /// this in Spawner preserves the existing struct size while making the
+    /// index available to render, where EffectMetadata cannot be bound.
+    properties_array_index: u32,
+    /// Nonzero when the instance is rendered without simulation updates.
+    simulation_paused: u32,
+    simulation_padding: array<u32, 3>,
 
     {{SPAWNER_PADDING}}
 }
