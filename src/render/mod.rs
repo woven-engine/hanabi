@@ -113,7 +113,7 @@ use self::batch::EffectBatch;
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ParticleGpuStage {
-    /// CPU-authored particle data copied through the frame command encoder.
+    /// CPU-authored particle data uploaded through one compute-copy pass.
     Uploads,
     /// Buffer growth copies recorded before particle simulation.
     BufferCopies,
@@ -147,12 +147,6 @@ pub trait ParticleTimingProvider: Send + Sync + 'static {
         &self,
         stage: ParticleGpuStage,
     ) -> Option<wgpu::ComputePassTimestampWrites<'_>>;
-
-    /// Write the beginning of one semantic encoder stage.
-    fn begin_encoder_stage(&self, stage: ParticleGpuStage, encoder: &mut wgpu::CommandEncoder);
-
-    /// Write the end of one semantic encoder stage.
-    fn end_encoder_stage(&self, stage: ParticleGpuStage, encoder: &mut wgpu::CommandEncoder);
 }
 
 /// Semantic timing provider installed by Woven's render world.
@@ -174,13 +168,51 @@ impl ParticleTiming {
     ) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
         self.0.compute_pass_writes(stage)
     }
+}
 
-    fn begin_encoder_stage(&self, stage: ParticleGpuStage, encoder: &mut wgpu::CommandEncoder) {
-        self.0.begin_encoder_stage(stage, encoder);
-    }
+#[cfg(feature = "woven_internal_timing")]
+fn particle_upload_buffer_usage(usage: BufferUsages) -> BufferUsages {
+    usage | BufferUsages::STORAGE
+}
 
-    fn end_encoder_stage(&self, stage: ParticleGpuStage, encoder: &mut wgpu::CommandEncoder) {
-        self.0.end_encoder_stage(stage, encoder);
+#[cfg(not(feature = "woven_internal_timing"))]
+fn particle_upload_buffer_usage(usage: BufferUsages) -> BufferUsages {
+    usage
+}
+
+#[cfg(feature = "woven_internal_timing")]
+pub(super) struct ParticleBufferCopy {
+    source: Buffer,
+    source_offset: u64,
+    destination: Buffer,
+    destination_offset: u64,
+    size: u64,
+}
+
+#[cfg(feature = "woven_internal_timing")]
+impl ParticleBufferCopy {
+    pub(super) fn new(
+        source: Buffer,
+        source_offset: u64,
+        destination: Buffer,
+        destination_offset: u64,
+        size: u64,
+    ) -> Self {
+        assert!(size > 0);
+        assert!(source_offset.is_multiple_of(4));
+        assert!(destination_offset.is_multiple_of(4));
+        assert!(size.is_multiple_of(4));
+        assert!(source.usage().contains(BufferUsages::STORAGE));
+        assert!(destination.usage().contains(BufferUsages::STORAGE));
+        assert!(source_offset + size <= source.size());
+        assert!(destination_offset + size <= destination.size());
+        Self {
+            source,
+            source_offset,
+            destination,
+            destination_offset,
+            size,
+        }
     }
 }
 
@@ -218,14 +250,9 @@ impl ParticleUploadQueue {
         });
     }
 
-    fn flush(
-        &mut self,
-        render_device: &RenderDevice,
-        encoder: &mut CommandEncoder,
-        timing: Option<&ParticleTiming>,
-    ) {
+    fn take_copies(&mut self, render_device: &RenderDevice) -> Vec<ParticleBufferCopy> {
         if self.pending.is_empty() {
-            return;
+            return Vec::new();
         }
 
         let staging_size = self
@@ -235,7 +262,7 @@ impl ParticleUploadQueue {
         let staging = render_device.create_buffer(&BufferDescriptor {
             label: Some("hanabi:buffer:particle_uploads"),
             size: staging_size,
-            usage: BufferUsages::COPY_SRC,
+            usage: BufferUsages::STORAGE,
             mapped_at_creation: true,
         });
         {
@@ -251,24 +278,43 @@ impl ParticleUploadQueue {
         }
         staging.unmap();
 
-        if let Some(timing) = timing {
-            timing.begin_encoder_stage(ParticleGpuStage::Uploads, encoder);
-        }
         let mut source_offset = 0;
-        for upload in self.pending.drain(..) {
-            let size = upload.bytes.len() as u64;
-            encoder.copy_buffer_to_buffer(
-                &staging,
-                source_offset,
-                &upload.target,
-                upload.target_offset,
-                size,
-            );
-            source_offset += size;
-        }
-        if let Some(timing) = timing {
-            timing.end_encoder_stage(ParticleGpuStage::Uploads, encoder);
-        }
+        let copies = self
+            .pending
+            .drain(..)
+            .map(|upload| {
+                let size = upload.bytes.len() as u64;
+                let copy = ParticleBufferCopy::new(
+                    staging.clone(),
+                    source_offset,
+                    upload.target,
+                    upload.target_offset,
+                    size,
+                );
+                source_offset += size;
+                copy
+            })
+            .collect();
+        copies
+    }
+
+    fn flush(
+        &mut self,
+        render_device: &RenderDevice,
+        command_encoder: &mut CommandEncoder,
+        utils_pipeline: &UtilsPipeline,
+        timing: Option<&ParticleTiming>,
+    ) {
+        let copies = self.take_copies(render_device);
+        dispatch_particle_copies(
+            render_device,
+            command_encoder,
+            utils_pipeline,
+            copies,
+            "hanabi:particle_uploads",
+            timing,
+            ParticleGpuStage::Uploads,
+        );
     }
 }
 
@@ -1356,6 +1402,109 @@ pub(super) struct GpuBufferOperationArgs {
     count: u32,
 }
 
+#[cfg(feature = "woven_internal_timing")]
+fn dispatch_particle_copies(
+    render_device: &RenderDevice,
+    command_encoder: &mut CommandEncoder,
+    utils_pipeline: &UtilsPipeline,
+    copies: Vec<ParticleBufferCopy>,
+    label: &'static str,
+    timing: Option<&ParticleTiming>,
+    stage: ParticleGpuStage,
+) {
+    if copies.is_empty() {
+        return;
+    }
+
+    let uniform_alignment = u64::from(render_device.limits().min_uniform_buffer_offset_alignment);
+    let args_size = GpuBufferOperationArgs::SHADER_SIZE.get();
+    let args_stride = args_size.next_multiple_of(uniform_alignment.max(1));
+    let args_buffer = render_device.create_buffer(&BufferDescriptor {
+        label: Some("hanabi:buffer:particle_copy_args"),
+        size: args_stride * copies.len() as u64,
+        usage: BufferUsages::UNIFORM,
+        mapped_at_creation: true,
+    });
+    let mut binding_data = Vec::with_capacity(copies.len());
+    {
+        let mut mapped = args_buffer.slice(..).get_mapped_range_mut();
+        for (index, copy) in copies.iter().enumerate() {
+            let args = GpuBufferOperationArgs {
+                src_offset: u32::try_from(copy.source_offset / 4)
+                    .expect("particle copy source offset fits u32 words"),
+                src_stride: 1,
+                dst_offset: u32::try_from(copy.destination_offset / 4)
+                    .expect("particle copy destination offset fits u32 words"),
+                dst_stride: 1,
+                count: u32::try_from(copy.size / 4).expect("particle copy size fits u32 words"),
+            };
+            let args_offset = index as u64 * args_stride;
+            let args_bytes = bytemuck::bytes_of(&args);
+            mapped
+                .slice(args_offset as usize..args_offset as usize + args_bytes.len())
+                .copy_from_slice(args_bytes);
+            binding_data.push((args_offset, args.count));
+        }
+    }
+    args_buffer.unmap();
+
+    let bind_group_layout = utils_pipeline.bind_group_layout(GpuBufferOperationType::Copy, true);
+    let bind_groups = copies
+        .iter()
+        .zip(&binding_data)
+        .map(|(copy, _)| {
+            render_device.create_bind_group(
+                label,
+                bind_group_layout,
+                &[
+                    BindGroupEntry {
+                        binding: 0,
+                        resource: BindingResource::Buffer(BufferBinding {
+                            buffer: &args_buffer,
+                            offset: 0,
+                            size: Some(NonZeroU64::new(args_size).unwrap()),
+                        }),
+                    },
+                    BindGroupEntry {
+                        binding: 1,
+                        resource: BindingResource::Buffer(BufferBinding {
+                            buffer: &copy.source,
+                            offset: 0,
+                            size: Some(NonZeroU64::new(copy.source.size()).unwrap()),
+                        }),
+                    },
+                    BindGroupEntry {
+                        binding: 2,
+                        resource: BindingResource::Buffer(BufferBinding {
+                            buffer: &copy.destination,
+                            offset: 0,
+                            size: Some(NonZeroU64::new(copy.destination.size()).unwrap()),
+                        }),
+                    },
+                ],
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut compute_pass = command_encoder.begin_compute_pass(&ComputePassDescriptor {
+        label: Some(label),
+        timestamp_writes: timing.and_then(|timing| timing.compute_pass_writes(stage)),
+    });
+    compute_pass.set_pipeline(utils_pipeline.get_pipeline(GpuBufferOperationType::Copy));
+    for (bind_group, &(args_offset, count)) in bind_groups.iter().zip(&binding_data) {
+        compute_pass.set_bind_group(
+            0,
+            bind_group,
+            &[
+                u32::try_from(args_offset).expect("particle copy args offset fits u32"),
+                0,
+                0,
+            ],
+        );
+        compute_pass.dispatch_workgroups(count.div_ceil(64), 1, 1);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct QueuedOperationBindGroupKey {
     src_buffer: BufferId,
@@ -1887,6 +2036,13 @@ impl FromWorld for UtilsPipeline {
             ],
         }
     }
+}
+
+#[cfg(test)]
+pub(super) fn test_utils_pipeline(render_device: &RenderDevice) -> UtilsPipeline {
+    let mut world = World::new();
+    world.insert_resource(render_device.clone());
+    UtilsPipeline::from_world(&mut world)
 }
 
 impl UtilsPipeline {
@@ -7514,25 +7670,15 @@ fn simulate(
     uploads.flush(
         &render_device,
         render_context.command_encoder(),
+        &utils_pipeline,
         timing.as_deref(),
     );
 
     // Make sure to schedule any buffer copy before accessing their content later in
     // the GPU commands below.
+    #[cfg(not(feature = "woven_internal_timing"))]
     {
         let command_encoder = render_context.command_encoder();
-        #[cfg(feature = "woven_internal_timing")]
-        let has_buffer_copies = effects_meta.dispatch_indirect_buffer.has_pending_copy()
-            || effects_meta.draw_indirect_buffer.has_pending_copy()
-            || effects_meta.effect_metadata_buffer.has_pending_copy()
-            || event_cache.has_pending_copy()
-            || sort_bind_groups.has_pending_copy();
-        #[cfg(feature = "woven_internal_timing")]
-        if has_buffer_copies {
-            if let Some(timing) = timing.as_deref() {
-                timing.begin_encoder_stage(ParticleGpuStage::BufferCopies, command_encoder);
-            }
-        }
         effects_meta
             .dispatch_indirect_buffer
             .write_buffers(command_encoder);
@@ -7544,13 +7690,28 @@ fn simulate(
             .write_buffer(command_encoder);
         event_cache.write_buffers(command_encoder);
         sort_bind_groups.write_buffers(command_encoder);
-        #[cfg(feature = "woven_internal_timing")]
-        if has_buffer_copies {
-            if let Some(timing) = timing.as_deref() {
-                timing.end_encoder_stage(ParticleGpuStage::BufferCopies, command_encoder);
-            }
-        }
     }
+    #[cfg(feature = "woven_internal_timing")]
+    let buffer_copies = [
+        effects_meta.dispatch_indirect_buffer.pending_copy(),
+        effects_meta.draw_indirect_buffer.pending_copy(),
+        effects_meta.effect_metadata_buffer.pending_copy(),
+        event_cache.pending_copy(),
+        sort_bind_groups.pending_copy(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    #[cfg(feature = "woven_internal_timing")]
+    dispatch_particle_copies(
+        &render_device,
+        render_context.command_encoder(),
+        &utils_pipeline,
+        buffer_copies,
+        "hanabi:particle_buffer_growth",
+        timing.as_deref(),
+        ParticleGpuStage::BufferCopies,
+    );
 
     // Compute init fill dispatch pass - Fill the indirect dispatch structs for any
     // upcoming init pass of this frame, based on the GPU spawn events emitted by
@@ -7605,8 +7766,24 @@ fn simulate(
         return;
     };
 
+    let has_init_work = sorted_effect_batches.iter().iter().any(|effect_batch| {
+        let use_indirect_dispatch = effect_batch
+            .layout_flags
+            .contains(LayoutFlags::CONSUME_GPU_SPAWN_EVENTS);
+        match effect_batch.spawn_info {
+            BatchSpawnInfo::CpuSpawner { total_spawn_count } => {
+                assert!(!use_indirect_dispatch);
+                total_spawn_count > 0
+            }
+            BatchSpawnInfo::GpuSpawner { .. } => {
+                assert!(use_indirect_dispatch);
+                true
+            }
+        }
+    });
+
     // Compute init pass
-    {
+    if has_init_work {
         trace!("init: loop over effect batches...");
 
         let mut compute_pass = begin_hanabi_compute_pass(
@@ -8290,20 +8467,6 @@ mod tests {
                 self.0.lock().unwrap().push(stage);
                 None
             }
-
-            fn begin_encoder_stage(
-                &self,
-                _stage: ParticleGpuStage,
-                _encoder: &mut wgpu::CommandEncoder,
-            ) {
-            }
-
-            fn end_encoder_stage(
-                &self,
-                _stage: ParticleGpuStage,
-                _encoder: &mut wgpu::CommandEncoder,
-            ) {
-            }
         }
 
         let observed = Arc::new(Mutex::new(Vec::new()));
@@ -8325,35 +8488,20 @@ mod tests {
 
     #[cfg(all(feature = "woven_internal_timing", feature = "gpu_tests"))]
     #[test]
-    fn particle_uploads_share_one_semantic_encoder_scope() {
+    fn particle_uploads_share_one_semantic_compute_pass() {
         use std::sync::Mutex;
 
         use crate::test_utils::MockRenderer;
 
-        struct RecordingProvider(Arc<Mutex<Vec<(&'static str, ParticleGpuStage)>>>);
+        struct RecordingProvider(Arc<Mutex<Vec<ParticleGpuStage>>>);
 
         impl ParticleTimingProvider for RecordingProvider {
             fn compute_pass_writes(
                 &self,
-                _stage: ParticleGpuStage,
+                stage: ParticleGpuStage,
             ) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+                self.0.lock().unwrap().push(stage);
                 None
-            }
-
-            fn begin_encoder_stage(
-                &self,
-                stage: ParticleGpuStage,
-                _encoder: &mut wgpu::CommandEncoder,
-            ) {
-                self.0.lock().unwrap().push(("begin", stage));
-            }
-
-            fn end_encoder_stage(
-                &self,
-                stage: ParticleGpuStage,
-                _encoder: &mut wgpu::CommandEncoder,
-            ) {
-                self.0.lock().unwrap().push(("end", stage));
             }
         }
 
@@ -8362,7 +8510,7 @@ mod tests {
         let target = device.create_buffer(&BufferDescriptor {
             label: Some("particle upload semantic scope test"),
             size: 8,
-            usage: BufferUsages::COPY_DST,
+            usage: BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
         let observed = Arc::new(Mutex::new(Vec::new()));
@@ -8373,15 +8521,163 @@ mod tests {
         let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
             label: Some("particle upload semantic scope test"),
         });
-        uploads.flush(&device, &mut encoder, Some(&timing));
+        let utils_pipeline = test_utils_pipeline(&device);
+        uploads.flush(&device, &mut encoder, &utils_pipeline, Some(&timing));
         let _ = encoder.finish();
 
-        assert_eq!(
-            *observed.lock().unwrap(),
-            [
-                ("begin", ParticleGpuStage::Uploads),
-                ("end", ParticleGpuStage::Uploads),
-            ]
+        assert_eq!(*observed.lock().unwrap(), [ParticleGpuStage::Uploads]);
+    }
+
+    #[cfg(all(feature = "woven_internal_timing", feature = "gpu_tests"))]
+    #[test]
+    #[ignore = "requires a timestamp-capable physical GPU; run on the Metal adapter"]
+    fn particle_copy_compute_passes_have_positive_physical_timestamps() {
+        use crate::test_utils::MockRenderer;
+
+        struct QueryProvider {
+            query_set: wgpu::QuerySet,
+            stage: ParticleGpuStage,
+        }
+
+        impl ParticleTimingProvider for QueryProvider {
+            fn compute_pass_writes(
+                &self,
+                stage: ParticleGpuStage,
+            ) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+                assert_eq!(stage, self.stage);
+                Some(wgpu::ComputePassTimestampWrites {
+                    query_set: &self.query_set,
+                    beginning_of_pass_write_index: Some(0),
+                    end_of_pass_write_index: Some(1),
+                })
+            }
+        }
+
+        fn measure(stage: ParticleGpuStage) -> [u64; 2] {
+            const COPY_BYTES: u64 = 4 * 1024 * 1024;
+
+            let renderer = MockRenderer::with_features(wgpu::Features::TIMESTAMP_QUERY);
+            let device = renderer.device();
+            let queue = renderer.queue();
+            let query_set = device
+                .wgpu_device()
+                .create_query_set(&wgpu::QuerySetDescriptor {
+                    label: Some("particle copy timestamp test"),
+                    ty: wgpu::QueryType::Timestamp,
+                    count: 2,
+                });
+            let timing = ParticleTiming::new(Arc::new(QueryProvider {
+                query_set: query_set.clone(),
+                stage,
+            }));
+            let utils_pipeline = test_utils_pipeline(&device);
+            let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("particle copy timestamp test"),
+            });
+            match stage {
+                ParticleGpuStage::Uploads => {
+                    let target = device.create_buffer(&BufferDescriptor {
+                        label: Some("particle upload timestamp target"),
+                        size: COPY_BYTES,
+                        usage: BufferUsages::STORAGE,
+                        mapped_at_creation: false,
+                    });
+                    let mut uploads = ParticleUploadQueue::default();
+                    uploads.write_buffer(&target, 0, &vec![0x5a; COPY_BYTES as usize]);
+                    uploads.flush(&device, &mut encoder, &utils_pipeline, Some(&timing));
+                }
+                ParticleGpuStage::BufferCopies => {
+                    let source = device.create_buffer(&BufferDescriptor {
+                        label: Some("particle growth timestamp source"),
+                        size: COPY_BYTES,
+                        usage: BufferUsages::STORAGE,
+                        mapped_at_creation: false,
+                    });
+                    let destination = device.create_buffer(&BufferDescriptor {
+                        label: Some("particle growth timestamp destination"),
+                        size: COPY_BYTES,
+                        usage: BufferUsages::STORAGE,
+                        mapped_at_creation: false,
+                    });
+                    dispatch_particle_copies(
+                        &device,
+                        &mut encoder,
+                        &utils_pipeline,
+                        vec![ParticleBufferCopy::new(
+                            source,
+                            0,
+                            destination,
+                            0,
+                            COPY_BYTES,
+                        )],
+                        "hanabi:particle_growth_timestamp_test",
+                        Some(&timing),
+                        stage,
+                    );
+                }
+                _ => unreachable!(),
+            }
+            queue.submit([encoder.finish()]);
+            let (sender, receiver) = futures::channel::oneshot::channel();
+            queue.on_submitted_work_done(move || {
+                sender.send(()).unwrap();
+            });
+            device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                })
+                .unwrap();
+            futures::executor::block_on(receiver).unwrap();
+
+            let resolve_buffer = device.create_buffer(&BufferDescriptor {
+                label: Some("particle copy timestamp resolve"),
+                size: 2 * 8,
+                usage: BufferUsages::QUERY_RESOLVE | BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let readback_buffer = device.create_buffer(&BufferDescriptor {
+                label: Some("particle copy timestamp readback"),
+                size: 2 * 8,
+                usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut resolve_encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("particle copy timestamp resolve"),
+            });
+            resolve_encoder.resolve_query_set(&query_set, 0..2, &resolve_buffer, 0);
+            let mut readback_encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("particle copy timestamp readback"),
+            });
+            readback_encoder.copy_buffer_to_buffer(&resolve_buffer, 0, &readback_buffer, 0, 2 * 8);
+            queue.submit([resolve_encoder.finish(), readback_encoder.finish()]);
+
+            let slice = readback_buffer.slice(..);
+            let (sender, receiver) = futures::channel::oneshot::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                sender.send(result).unwrap();
+            });
+            device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                })
+                .unwrap();
+            futures::executor::block_on(receiver).unwrap().unwrap();
+            let mapped = slice.get_mapped_range();
+            let ticks = bytemuck::cast_slice::<u8, u64>(&mapped);
+            [ticks[0], ticks[1]]
+        }
+
+        let upload_ticks = measure(ParticleGpuStage::Uploads);
+        let growth_ticks = measure(ParticleGpuStage::BufferCopies);
+        assert!(
+            upload_ticks[1] > upload_ticks[0],
+            "upload timestamps were {upload_ticks:?}"
+        );
+        assert!(
+            growth_ticks[1] > growth_ticks[0],
+            "growth-copy timestamps were {growth_ticks:?}"
         );
     }
 

@@ -53,10 +53,11 @@ Woven carries seven narrow private seams:
    update, optional sort prefix, sort-fill dispatch, and the existing combined
    sort-fill/sort/sorted-index-copy pass. Woven owns query sets, raw indices,
    resolution, aggregation, and budgets. With this feature enabled, every
-   Hanabi CPU upload uses one common mapped staging buffer and real
-   command-encoder copies in ordinary Play and capture; capture changes only
-   whether the provider returns timestamp writes. Feature-disabled Hanabi
-   retains its upstream queue-write path. `ParticleRenderBatch` marks Hanabi's
+   Hanabi CPU upload and buffer-growth copy uses the existing `copy_buffer`
+   compute pipeline in ordinary Play and capture. One descriptor-timestampable
+   pass covers each semantic stage; capture changes only whether the provider
+   returns timestamp writes. Feature-disabled Hanabi retains its upstream
+   queue-write and encoder-copy paths. `ParticleRenderBatch` marks Hanabi's
    temporary draw entities so Woven can classify routed render runs without
    changing their sorted phase.
 
@@ -81,5 +82,22 @@ These private seams can be removed once upstream exposes equivalent render
 property access, per-instance paused simulation, correct matrix property
 layout behavior, independent material-resource bindings, and observable
 device-pipeline prewarming. The timing seam can be removed once upstream
-exposes equivalent semantic stage hooks, a command-encoder upload path, and
-semantic particle-draw classification.
+exposes equivalent semantic stage hooks, descriptor-timestampable uploads and
+growth copies, and semantic particle-draw classification.
+
+## Descriptor-timestampable copy proof
+
+The H2 copy change was verified on 2026-08-28 on the Apple M4 Pro Metal
+adapter. `cargo test --lib --features woven_internal_timing,3d` passed 176
+tests with the physical oracle ignored by default. Running
+`particle_copy_compute_passes_have_positive_physical_timestamps` explicitly
+passed and required positive intervals for both the real upload queue and the
+real growth-copy dispatcher. The `single_particle` and `properties`
+all-features graphical tests also exited successfully.
+
+`cargo fmt --all -- --check`, `cargo check --all-features`, `cargo check --lib
+--no-default-features --features 3d`, and `cargo clippy --lib --tests --features
+woven_internal_timing,3d -- -D warnings` passed. An additional all-targets
+clippy probe reached the three examples that the prior H1 commit left without
+the private `EffectMaterial.woven_samplers` field; that pre-existing example
+failure is not part of the H2 copy-timing delta.

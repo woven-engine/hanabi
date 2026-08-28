@@ -11,6 +11,7 @@ use bevy::{
     },
 };
 use bytemuck::Pod;
+#[cfg(not(feature = "woven_internal_timing"))]
 use wgpu::CommandEncoder;
 
 struct BufferAndSize {
@@ -307,7 +308,7 @@ impl<T: Pod + ShaderType + ShaderSize> GpuBuffer<T> {
         let buffer = render_device.create_buffer(&BufferDescriptor {
             label: self.label.as_ref().map(|s| &s[..]),
             size: byte_size as BufferAddress,
-            usage: BufferUsages::COPY_DST | self.buffer_usage,
+            usage: super::particle_upload_buffer_usage(BufferUsages::COPY_DST | self.buffer_usage),
             mapped_at_creation: false,
         });
         self.buffer = Some(BufferAndSize {
@@ -328,6 +329,7 @@ impl<T: Pod + ShaderType + ShaderSize> GpuBuffer<T> {
     /// a no-op if there's no need for a buffer copy.
     ///
     /// [`prepare_buffers()`]: Self::prepare_buffers
+    #[cfg(not(feature = "woven_internal_timing"))]
     pub fn write_buffers(&self, command_encoder: &mut CommandEncoder) {
         if let Some(old_buffer) = self.old_buffer.as_ref() {
             let new_buffer = self.buffer.as_ref().unwrap();
@@ -358,7 +360,15 @@ impl<T: Pod + ShaderType + ShaderSize> GpuBuffer<T> {
     }
 
     #[cfg(feature = "woven_internal_timing")]
-    pub fn has_pending_copy(&self) -> bool {
-        self.old_buffer.is_some()
+    pub(super) fn pending_copy(&self) -> Option<super::ParticleBufferCopy> {
+        let old_buffer = self.old_buffer.as_ref()?;
+        let new_buffer = self.buffer.as_ref().unwrap();
+        Some(super::ParticleBufferCopy::new(
+            old_buffer.buffer.clone(),
+            0,
+            new_buffer.buffer.clone(),
+            0,
+            old_buffer.size as u64,
+        ))
     }
 }

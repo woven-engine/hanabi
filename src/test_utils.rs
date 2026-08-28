@@ -146,6 +146,11 @@ pub(crate) struct MockRenderer {
 impl MockRenderer {
     /// Create a new mock renderer with a default backend and adapter.
     pub fn new() -> Self {
+        Self::with_features(wgpu::Features::empty())
+    }
+
+    /// Create a new mock renderer with additional required device features.
+    pub fn with_features(additional_features: wgpu::Features) -> Self {
         #[cfg(debug_assertions)]
         let flags = wgpu::InstanceFlags::DEBUG | wgpu::InstanceFlags::VALIDATION;
         #[cfg(not(debug_assertions))]
@@ -174,7 +179,7 @@ impl MockRenderer {
             futures::executor::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 // Request MAPPABLE_PRIMARY_BUFFERS to allow MAP_WRITE|COPY_DST.
                 // FIXME - Should use a separate buffer from primary to support more platforms.
-                required_features: wgpu::Features::MAPPABLE_PRIMARY_BUFFERS,
+                required_features: wgpu::Features::MAPPABLE_PRIMARY_BUFFERS | additional_features,
                 // Request downlevel_defaults() for maximum compatibility in testing. The actual
                 // Hanabi library uses the default requested mode of the app.
                 required_limits: wgpu::Limits::downlevel_defaults(),

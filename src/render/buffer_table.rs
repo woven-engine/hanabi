@@ -7,13 +7,15 @@ use bevy::{
     log::trace,
     render::{
         render_resource::{
-            Buffer, BufferAddress, BufferDescriptor, BufferUsages, CommandEncoder, ShaderSize,
-            ShaderType,
+            Buffer, BufferAddress, BufferDescriptor, BufferUsages, ShaderSize, ShaderType,
         },
         renderer::{RenderDevice, RenderQueue},
     },
 };
 use bytemuck::{cast_slice, Pod};
+
+#[cfg(not(feature = "woven_internal_timing"))]
+use bevy::render::render_resource::CommandEncoder;
 
 #[cfg(feature = "woven_internal_timing")]
 use super::ParticleUploadQueue;
@@ -668,7 +670,7 @@ impl<T: Pod + ShaderSize> BufferTable<T> {
             let new_buffer = device.create_buffer(&BufferDescriptor {
                 label: self.label.as_ref().map(|s| &s[..]),
                 size: byte_size as BufferAddress,
-                usage: self.buffer_usage,
+                usage: super::particle_upload_buffer_usage(self.buffer_usage),
                 mapped_at_creation: has_init_data && !cfg!(feature = "woven_internal_timing"),
             });
 
@@ -820,6 +822,7 @@ impl<T: Pod + ShaderSize> BufferTable<T> {
     }
 
     /// Write CPU data to the GPU buffer, (re)allocating it as needed.
+    #[cfg(not(feature = "woven_internal_timing"))]
     pub fn write_buffer(&self, encoder: &mut CommandEncoder) {
         // Check if there's any work to do: either some pending values to upload or some
         // existing buffer to copy into a newly-allocated one.
@@ -860,10 +863,16 @@ impl<T: Pod + ShaderSize> BufferTable<T> {
     }
 
     #[cfg(feature = "woven_internal_timing")]
-    pub fn has_pending_copy(&self) -> bool {
-        self.buffer
-            .as_ref()
-            .is_some_and(|buffer| buffer.old_buffer.is_some())
+    pub(super) fn pending_copy(&self) -> Option<super::ParticleBufferCopy> {
+        let buffer = self.buffer.as_ref()?;
+        let old_buffer = buffer.old_buffer.as_ref()?;
+        Some(super::ParticleBufferCopy::new(
+            old_buffer.clone(),
+            0,
+            buffer.buffer.clone(),
+            0,
+            self.to_byte_size(buffer.old_count) as u64,
+        ))
     }
 }
 
@@ -1183,7 +1192,22 @@ mod gpu_tests {
             label: Some("test"),
         });
         #[cfg(feature = "woven_internal_timing")]
-        uploads.flush(device, &mut encoder, None);
+        {
+            let utils_pipeline = crate::render::test_utils_pipeline(device);
+            uploads.flush(device, &mut encoder, &utils_pipeline, None);
+            if let Some(copy) = table.pending_copy() {
+                crate::render::dispatch_particle_copies(
+                    device,
+                    &mut encoder,
+                    &utils_pipeline,
+                    vec![copy],
+                    "hanabi:test_buffer_growth",
+                    None,
+                    crate::render::ParticleGpuStage::BufferCopies,
+                );
+            }
+        }
+        #[cfg(not(feature = "woven_internal_timing"))]
         table.write_buffer(&mut encoder);
         let command_buffer = encoder.finish();
         submit_gpu_and_wait(device, queue, command_buffer);

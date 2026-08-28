@@ -275,7 +275,9 @@ impl<T: Pod + ShaderSize> AlignedBufferVec<T> {
             let new_buffer = device.create_buffer(&BufferDescriptor {
                 label: self.label.as_ref().map(|s| &s[..]),
                 size: size as BufferAddress,
-                usage: BufferUsages::COPY_DST | self.buffer_usage,
+                usage: super::particle_upload_buffer_usage(
+                    BufferUsages::COPY_DST | self.buffer_usage,
+                ),
                 mapped_at_creation: false,
             });
             trace!(
@@ -872,7 +874,9 @@ impl HybridAlignedBufferVec {
             self.buffer = Some(device.create_buffer(&BufferDescriptor {
                 label: self.label.as_ref().map(|s| &s[..]),
                 size: capacity as BufferAddress,
-                usage: BufferUsages::COPY_DST | self.buffer_usage,
+                usage: super::particle_upload_buffer_usage(
+                    BufferUsages::COPY_DST | self.buffer_usage,
+                ),
                 mapped_at_creation: false,
             }));
             self.is_stale = !self.values.is_empty();
@@ -1261,7 +1265,12 @@ mod gpu_tests {
             &mut uploads,
         ));
         #[cfg(feature = "woven_internal_timing")]
-        uploads.flush(&device, &mut encoder, None);
+        uploads.flush(
+            &device,
+            &mut encoder,
+            &crate::render::test_utils_pipeline(&device),
+            None,
+        );
         let command_buffer = encoder.finish();
         // need a submit() for write_buffer() to be processed
         queue.submit([command_buffer]);

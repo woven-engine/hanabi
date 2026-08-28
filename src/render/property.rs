@@ -406,7 +406,9 @@ impl PropertyBuffer {
             self.buffer = Some(device.create_buffer(&BufferDescriptor {
                 label: Some(&self.label[..]),
                 size: capacity as BufferAddress,
-                usage: BufferUsages::COPY_DST | self.buffer_usages,
+                usage: super::particle_upload_buffer_usage(
+                    BufferUsages::COPY_DST | self.buffer_usages,
+                ),
                 mapped_at_creation: false,
             }));
             self.is_stale = !self.values.is_empty();
@@ -1185,7 +1187,12 @@ mod gpu_tests {
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("property upload test"),
             });
-            uploads.flush(&device, &mut encoder, None);
+            uploads.flush(
+                &device,
+                &mut encoder,
+                &crate::render::test_utils_pipeline(&device),
+                None,
+            );
             queue.submit([encoder.finish()]);
             submit_and_wait(&device, &queue);
         }
@@ -1229,7 +1236,12 @@ mod gpu_tests {
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("property upload test"),
             });
-            uploads.flush(&device, &mut encoder, None);
+            uploads.flush(
+                &device,
+                &mut encoder,
+                &crate::render::test_utils_pipeline(&device),
+                None,
+            );
             queue.submit([encoder.finish()]);
             submit_and_wait(&device, &queue);
         }

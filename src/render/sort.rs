@@ -20,7 +20,10 @@ use bevy::{
     utils::default,
 };
 use bytemuck::{Pod, Zeroable};
-use wgpu::{BufferBinding, BufferDescriptor, BufferUsages, CommandEncoder, ShaderStages};
+use wgpu::{BufferBinding, BufferDescriptor, BufferUsages, ShaderStages};
+
+#[cfg(not(feature = "woven_internal_timing"))]
+use wgpu::CommandEncoder;
 
 use super::{gpu_buffer::GpuBuffer, GpuDispatchIndirectArgs, GpuEffectMetadata, StorageType};
 use crate::{
@@ -307,14 +310,15 @@ impl SortBindGroups {
     }
 
     #[inline]
+    #[cfg(not(feature = "woven_internal_timing"))]
     pub fn write_buffers(&self, command_encoder: &mut CommandEncoder) {
         self.indirect_buffer.write_buffers(command_encoder);
     }
 
     #[cfg(feature = "woven_internal_timing")]
     #[inline]
-    pub fn has_pending_copy(&self) -> bool {
-        self.indirect_buffer.has_pending_copy()
+    pub(super) fn pending_copy(&self) -> Option<super::ParticleBufferCopy> {
+        self.indirect_buffer.pending_copy()
     }
 
     #[inline]

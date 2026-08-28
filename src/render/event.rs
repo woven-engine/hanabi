@@ -23,7 +23,10 @@ use thiserror::Error;
 use wgpu::util::BufferInitDescriptor;
 #[cfg(any(not(debug_assertions), feature = "woven_internal_timing"))]
 use wgpu::BufferDescriptor;
-use wgpu::{BufferUsages, CommandEncoder, ShaderStages};
+use wgpu::{BufferUsages, ShaderStages};
+
+#[cfg(not(feature = "woven_internal_timing"))]
+use wgpu::CommandEncoder;
 
 #[cfg(feature = "woven_internal_timing")]
 use super::ParticleUploadQueue;
@@ -628,14 +631,15 @@ impl EventCache {
     /// This must be called once per frame after the buffers have been
     /// reallocated with `prepare_buffers()`.
     #[inline]
+    #[cfg(not(feature = "woven_internal_timing"))]
     pub fn write_buffers(&self, command_encoder: &mut CommandEncoder) {
         self.init_indirect_dispatch_buffer
             .write_buffers(command_encoder);
     }
 
     #[cfg(feature = "woven_internal_timing")]
-    pub fn has_pending_copy(&self) -> bool {
-        self.init_indirect_dispatch_buffer.has_pending_copy()
+    pub(super) fn pending_copy(&self) -> Option<super::ParticleBufferCopy> {
+        self.init_indirect_dispatch_buffer.pending_copy()
     }
 
     /// Destroy old copies of buffers reallocated last frame and copied to a new
