@@ -1,7 +1,6 @@
 use std::{
     borrow::Cow,
     num::{NonZeroU32, NonZeroU64},
-    ops::Range,
 };
 
 use bevy::{
@@ -16,9 +15,13 @@ use bevy::{
 };
 use bytemuck::{cast_slice, Pod};
 
+#[cfg(feature = "woven_internal_timing")]
+use super::ParticleUploadQueue;
+
 /// Round a range start down to a given alignment, and return the new range and
 /// the start offset inside the new range of the old range.
-fn round_range_start_down(range: Range<u64>, align: u64) -> (Range<u64>, u64) {
+#[cfg(any(not(feature = "woven_internal_timing"), test))]
+fn round_range_start_down(range: std::ops::Range<u64>, align: u64) -> (std::ops::Range<u64>, u64) {
     assert!(align > 0);
     let delta = align - 1;
     if range.start >= delta {
@@ -639,7 +642,12 @@ impl<T: Pod + ShaderSize> BufferTable<T> {
     /// group needs to be re-created.
     ///
     /// [`insert()]`: crate::render::BufferTable::insert
-    pub fn allocate_gpu(&mut self, device: &RenderDevice, queue: &RenderQueue) -> bool {
+    pub fn allocate_gpu(
+        &mut self,
+        device: &RenderDevice,
+        _queue: &RenderQueue,
+        #[cfg(feature = "woven_internal_timing")] uploads: &mut ParticleUploadQueue,
+    ) -> bool {
         // The allocated capacity is the capacity of the currently allocated GPU buffer,
         // which can be different from the expected capacity (self.capacity) for next
         // update.
@@ -661,12 +669,13 @@ impl<T: Pod + ShaderSize> BufferTable<T> {
                 label: self.label.as_ref().map(|s| &s[..]),
                 size: byte_size as BufferAddress,
                 usage: self.buffer_usage,
-                mapped_at_creation: has_init_data,
+                mapped_at_creation: has_init_data && !cfg!(feature = "woven_internal_timing"),
             });
 
             // Use any pending data to initialize the buffer. We only use CPU-available
             // data, which was inserted after the buffer was (re-)allocated and
             // has not been uploaded to GPU yet.
+            #[cfg(not(feature = "woven_internal_timing"))]
             if has_init_data {
                 // Leave some space to copy the old buffer if any
                 let base_size = self.to_byte_size(allocated_count) as u64;
@@ -702,6 +711,18 @@ impl<T: Pod + ShaderSize> BufferTable<T> {
                 }
 
                 new_buffer.unmap();
+            }
+            #[cfg(feature = "woven_internal_timing")]
+            if has_init_data {
+                let base_size = self.to_byte_size(allocated_count) as u64;
+                let extra_count = self.extra_pending_values.len();
+                let mut aligned_buffer = vec![0_u8; self.aligned_size * extra_count];
+                for (index, content) in self.extra_pending_values.drain(..).enumerate() {
+                    let src: &[u8] = cast_slice(std::slice::from_ref(&content));
+                    let byte_offset = self.aligned_size * index;
+                    aligned_buffer[byte_offset..byte_offset + self.item_size].copy_from_slice(src);
+                }
+                uploads.write_buffer(&new_buffer, base_size, &aligned_buffer);
             }
 
             if let Some(ab) = self.buffer.as_mut() {
@@ -785,7 +806,10 @@ impl<T: Pod + ShaderSize> BufferTable<T> {
                 // Upload to GPU
                 // TODO - Merge contiguous blocks into a single write_buffer()
                 let bytes: &[u8] = cast_slice(&aligned_buffer);
-                queue.write_buffer(buffer, byte_offset as u64, bytes);
+                #[cfg(not(feature = "woven_internal_timing"))]
+                _queue.write_buffer(buffer, byte_offset as u64, bytes);
+                #[cfg(feature = "woven_internal_timing")]
+                uploads.write_buffer(buffer, byte_offset as u64, bytes);
             }
         } else {
             debug_assert!(self.pending_values.is_empty());
@@ -833,6 +857,13 @@ impl<T: Pod + ShaderSize> BufferTable<T> {
             trace!("Copy old buffer id {:?} of size {} bytes into newly-allocated buffer {:?} of size {} bytes.", old_buffer.id(), old_size, ab.buffer.id(), self.to_byte_size(ab.count));
             encoder.copy_buffer_to_buffer(old_buffer, 0, &ab.buffer, 0, old_size);
         }
+    }
+
+    #[cfg(feature = "woven_internal_timing")]
+    pub fn has_pending_copy(&self) -> bool {
+        self.buffer
+            .as_ref()
+            .is_some_and(|buffer| buffer.old_buffer.is_some())
     }
 }
 
@@ -1146,10 +1177,13 @@ mod gpu_tests {
         table: &BufferTable<T>,
         device: &RenderDevice,
         queue: &RenderQueue,
+        #[cfg(feature = "woven_internal_timing")] uploads: &mut ParticleUploadQueue,
     ) {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("test"),
         });
+        #[cfg(feature = "woven_internal_timing")]
+        uploads.flush(device, &mut encoder, None);
         table.write_buffer(&mut encoder);
         let command_buffer = encoder.finish();
         submit_gpu_and_wait(device, queue, command_buffer);
@@ -1161,6 +1195,8 @@ mod gpu_tests {
         let renderer = MockRenderer::new();
         let device = renderer.device();
         let queue = renderer.queue();
+        #[cfg(feature = "woven_internal_timing")]
+        let mut uploads = ParticleUploadQueue::default();
 
         let item_align = device.limits().min_storage_buffer_offset_alignment as u64;
         println!("min_storage_buffer_offset_alignment = {item_align}");
@@ -1180,8 +1216,19 @@ mod gpu_tests {
 
         // This has no effect while the table is empty
         table.clear_previous_frame_resizes();
-        table.allocate_gpu(&device, &queue);
-        write_buffers_and_wait(&table, &device, &queue);
+        table.allocate_gpu(
+            &device,
+            &queue,
+            #[cfg(feature = "woven_internal_timing")]
+            &mut uploads,
+        );
+        write_buffers_and_wait(
+            &table,
+            &device,
+            &queue,
+            #[cfg(feature = "woven_internal_timing")]
+            &mut uploads,
+        );
         assert!(table.is_empty());
         assert_eq!(table.len(), 0);
         assert_eq!(table.capacity(), 0);
@@ -1205,7 +1252,12 @@ mod gpu_tests {
         assert!(table.buffer.is_none()); // not yet allocated on GPU
 
         // Allocate GPU buffer for current requested state
-        table.allocate_gpu(&device, &queue);
+        table.allocate_gpu(
+            &device,
+            &queue,
+            #[cfg(feature = "woven_internal_timing")]
+            &mut uploads,
+        );
         assert!(!table.is_empty());
         assert_eq!(table.len(), len);
         assert!(table.capacity() >= len);
@@ -1223,7 +1275,12 @@ mod gpu_tests {
         let ab_buffer = ab.buffer.clone();
 
         // Another allocate_gpu() is a no-op
-        table.allocate_gpu(&device, &queue);
+        table.allocate_gpu(
+            &device,
+            &queue,
+            #[cfg(feature = "woven_internal_timing")]
+            &mut uploads,
+        );
         assert!(!table.is_empty());
         assert_eq!(table.len(), len);
         assert!(table.capacity() >= len);
@@ -1236,7 +1293,13 @@ mod gpu_tests {
         assert_eq!(ab_buffer.id(), ab.buffer.id()); // same buffer
 
         // Write buffer (CPU -> GPU)
-        write_buffers_and_wait(&table, &device, &queue);
+        write_buffers_and_wait(
+            &table,
+            &device,
+            &queue,
+            #[cfg(feature = "woven_internal_timing")]
+            &mut uploads,
+        );
 
         {
             // Read back (GPU -> CPU)
@@ -1286,7 +1349,12 @@ mod gpu_tests {
         );
 
         // This re-allocates a new GPU buffer because the capacity changed
-        table.allocate_gpu(&device, &queue);
+        table.allocate_gpu(
+            &device,
+            &queue,
+            #[cfg(feature = "woven_internal_timing")]
+            &mut uploads,
+        );
         assert!(!table.is_empty());
         assert_eq!(table.len(), len);
         assert!(table.capacity() >= len);
@@ -1304,7 +1372,13 @@ mod gpu_tests {
         );
 
         // Write buffer (CPU -> GPU)
-        write_buffers_and_wait(&table, &device, &queue);
+        write_buffers_and_wait(
+            &table,
+            &device,
+            &queue,
+            #[cfg(feature = "woven_internal_timing")]
+            &mut uploads,
+        );
 
         {
             // Read back (GPU -> CPU)
@@ -1346,7 +1420,12 @@ mod gpu_tests {
         );
 
         // This doesn't do anything since we removed a row only
-        table.allocate_gpu(&device, &queue);
+        table.allocate_gpu(
+            &device,
+            &queue,
+            #[cfg(feature = "woven_internal_timing")]
+            &mut uploads,
+        );
         assert!(!table.is_empty());
         assert_eq!(table.len(), len);
         assert!(table.capacity() >= len);
@@ -1358,7 +1437,13 @@ mod gpu_tests {
         assert!(ab.old_buffer.is_none());
 
         // Write buffer (CPU -> GPU)
-        write_buffers_and_wait(&table, &device, &queue);
+        write_buffers_and_wait(
+            &table,
+            &device,
+            &queue,
+            #[cfg(feature = "woven_internal_timing")]
+            &mut uploads,
+        );
 
         {
             // Read back (GPU -> CPU)
@@ -1401,7 +1486,12 @@ mod gpu_tests {
         );
 
         // This doesn't do anything since we only removed a row
-        table.allocate_gpu(&device, &queue);
+        table.allocate_gpu(
+            &device,
+            &queue,
+            #[cfg(feature = "woven_internal_timing")]
+            &mut uploads,
+        );
         assert!(!table.is_empty());
         assert_eq!(table.len(), len);
         assert!(table.capacity() >= len);
@@ -1413,7 +1503,13 @@ mod gpu_tests {
         assert!(ab.old_buffer.is_none());
 
         // Write buffer (CPU -> GPU)
-        write_buffers_and_wait(&table, &device, &queue);
+        write_buffers_and_wait(
+            &table,
+            &device,
+            &queue,
+            #[cfg(feature = "woven_internal_timing")]
+            &mut uploads,
+        );
 
         {
             // Read back (GPU -> CPU)
@@ -1460,7 +1556,12 @@ mod gpu_tests {
         );
 
         // This doesn't reallocate the GPU buffer since we used a free list entry
-        table.allocate_gpu(&device, &queue);
+        table.allocate_gpu(
+            &device,
+            &queue,
+            #[cfg(feature = "woven_internal_timing")]
+            &mut uploads,
+        );
         assert!(!table.is_empty());
         assert_eq!(table.len(), len);
         assert!(table.capacity() >= len);
@@ -1472,7 +1573,13 @@ mod gpu_tests {
         assert!(ab.old_buffer.is_none());
 
         // Write buffer (CPU -> GPU)
-        write_buffers_and_wait(&table, &device, &queue);
+        write_buffers_and_wait(
+            &table,
+            &device,
+            &queue,
+            #[cfg(feature = "woven_internal_timing")]
+            &mut uploads,
+        );
 
         {
             // Read back (GPU -> CPU)
@@ -1517,7 +1624,12 @@ mod gpu_tests {
         );
 
         // This doesn't reallocate the GPU buffer since we used an implicit free entry
-        table.allocate_gpu(&device, &queue);
+        table.allocate_gpu(
+            &device,
+            &queue,
+            #[cfg(feature = "woven_internal_timing")]
+            &mut uploads,
+        );
         assert!(!table.is_empty());
         assert_eq!(table.len(), len);
         assert!(table.capacity() >= len);
@@ -1529,7 +1641,13 @@ mod gpu_tests {
         assert!(ab.old_buffer.is_none());
 
         // Write buffer (CPU -> GPU)
-        write_buffers_and_wait(&table, &device, &queue);
+        write_buffers_and_wait(
+            &table,
+            &device,
+            &queue,
+            #[cfg(feature = "woven_internal_timing")]
+            &mut uploads,
+        );
 
         {
             // Read back (GPU -> CPU)

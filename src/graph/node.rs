@@ -771,12 +771,10 @@ equal to one."
 
 #[cfg(test)]
 mod tests {
-    use bevy::prelude::*;
+    use bevy::prelude::Vec3;
 
     use super::*;
-    use crate::{
-        node::Node as _, EvalContext, ModifierContext, ParticleLayout, PropertyLayout, ShaderWriter,
-    };
+    use crate::{EvalContext, ModifierContext, ParticleLayout, PropertyLayout, ShaderWriter};
 
     #[test]
     fn add() {

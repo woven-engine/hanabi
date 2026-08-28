@@ -23,6 +23,8 @@ use wgpu::{
 };
 
 use super::effect_cache::SlabState;
+#[cfg(feature = "woven_internal_timing")]
+use crate::render::ParticleUploadQueue;
 use crate::{
     render::{ExtractedProperties, GpuBatchInfo, GpuSpawnerParams, StorageType},
     PropertyLayout,
@@ -422,7 +424,12 @@ impl PropertyBuffer {
     /// `true` if the buffer was (re)allocated, `false` otherwise. If the buffer
     /// was reallocated, all bind groups referencing the old buffer should be
     /// destroyed.
-    pub fn write_buffer(&mut self, device: &RenderDevice, queue: &RenderQueue) -> bool {
+    pub fn write_buffer(
+        &mut self,
+        device: &RenderDevice,
+        _queue: &RenderQueue,
+        #[cfg(feature = "woven_internal_timing")] uploads: &mut ParticleUploadQueue,
+    ) -> bool {
         if self.values.is_empty() || !self.is_stale {
             return false;
         }
@@ -437,7 +444,10 @@ impl PropertyBuffer {
         );
         let buffer_changed = self.reserve(capacity, device);
         if let Some(buffer) = &self.buffer {
-            queue.write_buffer(buffer, 0, self.values.as_slice());
+            #[cfg(not(feature = "woven_internal_timing"))]
+            _queue.write_buffer(buffer, 0, self.values.as_slice());
+            #[cfg(feature = "woven_internal_timing")]
+            uploads.write_buffer(buffer, 0, self.values.as_slice());
             self.is_stale = false;
         }
         buffer_changed
@@ -967,6 +977,7 @@ pub(crate) fn on_remove_cached_properties(
 pub(crate) fn prepare_property_buffers(
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
+    #[cfg(feature = "woven_internal_timing")] mut uploads: ResMut<ParticleUploadQueue>,
     mut property_cache: ResMut<PropertyCache>,
     mut bind_groups: ResMut<PropertyBindGroups>,
 ) {
@@ -976,7 +987,12 @@ pub(crate) fn prepare_property_buffers(
         let Some(property_buffer) = buffer_slot.as_mut() else {
             continue;
         };
-        let changed = property_buffer.write_buffer(&render_device, &render_queue);
+        let changed = property_buffer.write_buffer(
+            &render_device,
+            &render_queue,
+            #[cfg(feature = "woven_internal_timing")]
+            &mut uploads,
+        );
         if changed {
             trace!("Destroying all bind groups for property buffer #{buffer_index}");
             bind_groups
@@ -1113,6 +1129,8 @@ mod gpu_tests {
         let renderer = MockRenderer::new();
         let device = renderer.device();
         let queue = renderer.queue();
+        #[cfg(feature = "woven_internal_timing")]
+        let mut uploads = ParticleUploadQueue::default();
 
         let mut pb = PropertyBuffer::new(None, BufferUsages::STORAGE | BufferUsages::MAP_READ);
         assert!(pb.is_empty());
@@ -1151,12 +1169,27 @@ mod gpu_tests {
         assert!(pb.buffer().is_none());
         assert_eq!(pb.capacity(), 0);
 
-        let buffer_changed = pb.write_buffer(&device, &queue);
+        let buffer_changed = pb.write_buffer(
+            &device,
+            &queue,
+            #[cfg(feature = "woven_internal_timing")]
+            &mut uploads,
+        );
         // GPU buffer now allocated
         assert!(buffer_changed);
         assert!(pb.buffer().is_some());
         assert!(pb.capacity() >= 20);
 
+        #[cfg(feature = "woven_internal_timing")]
+        {
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("property upload test"),
+            });
+            uploads.flush(&device, &mut encoder, None);
+            queue.submit([encoder.finish()]);
+            submit_and_wait(&device, &queue);
+        }
+        #[cfg(not(feature = "woven_internal_timing"))]
         submit_and_wait(&device, &queue);
         println!("Buffer written");
 
@@ -1180,12 +1213,27 @@ mod gpu_tests {
         assert!(pb.buffer().is_some());
         assert!(pb.capacity() >= 20);
 
-        let buffer_changed = pb.write_buffer(&device, &queue);
+        let buffer_changed = pb.write_buffer(
+            &device,
+            &queue,
+            #[cfg(feature = "woven_internal_timing")]
+            &mut uploads,
+        );
         // GPU buffer NOT re-allocated (only content changed)
         assert!(!buffer_changed);
         assert!(pb.buffer().is_some());
         assert!(pb.capacity() >= 20);
 
+        #[cfg(feature = "woven_internal_timing")]
+        {
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("property upload test"),
+            });
+            uploads.flush(&device, &mut encoder, None);
+            queue.submit([encoder.finish()]);
+            submit_and_wait(&device, &queue);
+        }
+        #[cfg(not(feature = "woven_internal_timing"))]
         submit_and_wait(&device, &queue);
         println!("Buffer written");
 

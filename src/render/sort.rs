@@ -311,6 +311,12 @@ impl SortBindGroups {
         self.indirect_buffer.write_buffers(command_encoder);
     }
 
+    #[cfg(feature = "woven_internal_timing")]
+    #[inline]
+    pub fn has_pending_copy(&self) -> bool {
+        self.indirect_buffer.has_pending_copy()
+    }
+
     #[inline]
     pub fn clear_previous_frame_resizes(&mut self) {
         self.indirect_buffer.clear_previous_frame_resizes();

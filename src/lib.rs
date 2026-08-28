@@ -215,10 +215,12 @@ pub use graph::*;
 pub use modifier::*;
 pub use plugin::{EffectSystems, HanabiPlugin};
 pub use properties::*;
-pub use render::{
-    DebugSettings, EffectComputeTimestampWrites, EffectTimestampInterval, LayoutFlags,
-    ParticleRenderBatch, ShaderCache,
-};
+pub use render::{DebugSettings, LayoutFlags, ParticleRenderBatch, ShaderCache};
+#[cfg(feature = "woven_internal_timing")]
+#[doc(hidden)]
+pub mod woven_private {
+    pub use crate::render::{ParticleGpuStage, ParticleTiming, ParticleTimingProvider};
+}
 pub use spawn::{tick_spawners, CpuValue, EffectSpawner, Random, SpawnerSettings};
 pub use time::{EffectSimulation, EffectSimulationTime};
 

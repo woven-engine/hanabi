@@ -19,12 +19,14 @@ use bevy::{
 };
 use bytemuck::{Pod, Zeroable};
 use thiserror::Error;
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, not(feature = "woven_internal_timing")))]
 use wgpu::util::BufferInitDescriptor;
-#[cfg(not(debug_assertions))]
+#[cfg(any(not(debug_assertions), feature = "woven_internal_timing"))]
 use wgpu::BufferDescriptor;
 use wgpu::{BufferUsages, CommandEncoder, ShaderStages};
 
+#[cfg(feature = "woven_internal_timing")]
+use super::ParticleUploadQueue;
 use super::{
     aligned_buffer_vec::HybridAlignedBufferVec, effect_cache::SlabState, gpu_buffer::GpuBuffer,
     BufferBindingSource, EffectBindGroups, GpuDispatchIndirectArgs,
@@ -248,6 +250,7 @@ impl CachedEffectEvents {
 pub(crate) fn allocate_events(
     mut commands: Commands,
     mut event_cache: ResMut<EventCache>,
+    #[cfg(feature = "woven_internal_timing")] mut uploads: ResMut<ParticleUploadQueue>,
     mut q_child_effects: Query<(Entity, Option<&mut CachedEffectEvents>), With<ChildEffectOf>>,
     q_old_child_effects: Query<Entity, (With<CachedEffectEvents>, Without<ChildEffectOf>)>,
 ) {
@@ -264,7 +267,11 @@ pub(crate) fn allocate_events(
             // events, so the allocation won't ever change...
         } else {
             const FIXME_HARD_CODED_EVENT_COUNT: u32 = 256;
-            let cached_effect_events = event_cache.allocate(FIXME_HARD_CODED_EVENT_COUNT);
+            let cached_effect_events = event_cache.allocate(
+                FIXME_HARD_CODED_EVENT_COUNT,
+                #[cfg(feature = "woven_internal_timing")]
+                &mut uploads,
+            );
             commands.entity(entity).insert(cached_effect_events);
         }
     }
@@ -411,7 +418,11 @@ impl EventCache {
     /// # Panics
     ///
     /// Panics if the number of events `num_events` is zero.
-    pub fn allocate(&mut self, num_events: u32) -> CachedEffectEvents {
+    pub fn allocate(
+        &mut self,
+        num_events: u32,
+        #[cfg(feature = "woven_internal_timing")] uploads: &mut ParticleUploadQueue,
+    ) -> CachedEffectEvents {
         assert!(num_events > 0);
 
         // Allocate an entry into the indirect dispatch buffer
@@ -452,7 +463,7 @@ impl EventCache {
         let byte_size = (capacity as u64 * 4).next_multiple_of(align as u64);
         let capacity = (byte_size / 4) as u32;
         // In debug, fill the buffer with some debug marker
-        #[cfg(debug_assertions)]
+        #[cfg(all(debug_assertions, not(feature = "woven_internal_timing")))]
         let buffer = {
             let mut contents: Vec<u32> = Vec::with_capacity(capacity as usize);
             contents.resize(capacity as usize, 0xDEADBEEF);
@@ -463,13 +474,18 @@ impl EventCache {
             })
         };
         // In release, don't initialize the buffer for performance
-        #[cfg(not(debug_assertions))]
+        #[cfg(any(not(debug_assertions), feature = "woven_internal_timing"))]
         let buffer = self.device.create_buffer(&BufferDescriptor {
             label: Some(&label[..]),
             size: byte_size,
             usage: BufferUsages::COPY_DST | BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
+        #[cfg(all(debug_assertions, feature = "woven_internal_timing"))]
+        {
+            let contents = vec![0xDEADBEEFu32; capacity as usize];
+            uploads.write_buffer(&buffer, 0, bytemuck::cast_slice(&contents));
+        }
         trace!("Created new event buffer #{buffer_index} '{label}' with {byte_size} bytes ({capacity} events; align={align}B)");
         let mut buffer = EventBuffer::new(buffer, capacity);
 
@@ -588,6 +604,7 @@ impl EventCache {
         &mut self,
         render_device: &RenderDevice,
         render_queue: &RenderQueue,
+        #[cfg(feature = "woven_internal_timing")] uploads: &mut ParticleUploadQueue,
         // FIXME
         _effect_bind_groups: &mut ResMut<EffectBindGroups>,
     ) {
@@ -597,8 +614,12 @@ impl EventCache {
         self.init_indirect_dispatch_buffer
             .prepare_buffers(render_device);
 
-        self.child_infos_buffer
-            .write_buffer(render_device, render_queue);
+        self.child_infos_buffer.write_buffer(
+            render_device,
+            render_queue,
+            #[cfg(feature = "woven_internal_timing")]
+            uploads,
+        );
     }
 
     /// Schedule any pending buffer copy.
@@ -610,6 +631,11 @@ impl EventCache {
     pub fn write_buffers(&self, command_encoder: &mut CommandEncoder) {
         self.init_indirect_dispatch_buffer
             .write_buffers(command_encoder);
+    }
+
+    #[cfg(feature = "woven_internal_timing")]
+    pub fn has_pending_copy(&self) -> bool {
+        self.init_indirect_dispatch_buffer.has_pending_copy()
     }
 
     /// Destroy old copies of buffers reallocated last frame and copied to a new

@@ -47,6 +47,9 @@ trace = []
 # This is a testing-only feature, which has no effect on the build.
 gpu_tests = []
 
+# Enable Woven's private semantic particle timing integration.
+woven_internal_timing = []
+
 [dependencies]
 bytemuck = { version = "1.5", features = ["derive", "must_cast"] }
 fixedbitset = "0.5"

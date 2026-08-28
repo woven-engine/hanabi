@@ -12,6 +12,9 @@ use bevy::{
 };
 use bytemuck::{cast_slice, Pod};
 
+#[cfg(feature = "woven_internal_timing")]
+use super::ParticleUploadQueue;
+
 /// Like Bevy's [`BufferVec`], but with extra per-item alignment.
 ///
 /// This helper ensures the individual array elements are properly aligned,
@@ -295,7 +298,12 @@ impl<T: Pod + ShaderSize> AlignedBufferVec<T> {
     /// `true` if the buffer was (re)allocated, `false` otherwise. This
     /// indicates whether bind groups need to be re-created.
     #[must_use]
-    pub fn write_buffer(&mut self, device: &RenderDevice, queue: &RenderQueue) -> bool {
+    pub fn write_buffer(
+        &mut self,
+        device: &RenderDevice,
+        _queue: &RenderQueue,
+        #[cfg(feature = "woven_internal_timing")] uploads: &mut ParticleUploadQueue,
+    ) -> bool {
         if self.values.is_empty() {
             return false;
         }
@@ -318,7 +326,10 @@ impl<T: Pod + ShaderSize> AlignedBufferVec<T> {
                     buffer.id(),
                 );
                 let src: &[u8] = cast_slice(&self.values[..]);
-                queue.write_buffer(buffer, 0, src);
+                #[cfg(not(feature = "woven_internal_timing"))]
+                _queue.write_buffer(buffer, 0, src);
+                #[cfg(feature = "woven_internal_timing")]
+                uploads.write_buffer(buffer, 0, src);
             } else {
                 // The CPU storage contains items smaller than the aligned size; copy with
                 // padding into a temporary storage to align items, then write from that
@@ -343,7 +354,10 @@ impl<T: Pod + ShaderSize> AlignedBufferVec<T> {
                     let dst = &mut aligned_buffer[dst_range];
                     dst.copy_from_slice(src);
                 }
-                queue.write_buffer(buffer, 0, &aligned_buffer[..]);
+                #[cfg(not(feature = "woven_internal_timing"))]
+                _queue.write_buffer(buffer, 0, &aligned_buffer[..]);
+                #[cfg(feature = "woven_internal_timing")]
+                uploads.write_buffer(buffer, 0, &aligned_buffer[..]);
             }
         }
         buffer_changed
@@ -876,7 +890,12 @@ impl HybridAlignedBufferVec {
     /// `true` if the buffer was (re)allocated, `false` otherwise. If the buffer
     /// was reallocated, all bind groups referencing the old buffer should be
     /// destroyed.
-    pub fn write_buffer(&mut self, device: &RenderDevice, queue: &RenderQueue) -> bool {
+    pub fn write_buffer(
+        &mut self,
+        device: &RenderDevice,
+        _queue: &RenderQueue,
+        #[cfg(feature = "woven_internal_timing")] uploads: &mut ParticleUploadQueue,
+    ) -> bool {
         if self.values.is_empty() || !self.is_stale {
             return false;
         }
@@ -888,7 +907,10 @@ impl HybridAlignedBufferVec {
         );
         let buffer_changed = self.reserve(size, device);
         if let Some(buffer) = &self.buffer {
-            queue.write_buffer(buffer, 0, self.values.as_slice());
+            #[cfg(not(feature = "woven_internal_timing"))]
+            _queue.write_buffer(buffer, 0, self.values.as_slice());
+            #[cfg(feature = "woven_internal_timing")]
+            uploads.write_buffer(buffer, 0, self.values.as_slice());
             self.is_stale = false;
         }
         buffer_changed
@@ -1196,10 +1218,14 @@ mod gpu_tests {
 
         // Create a dummy CommandBuffer to force the write_buffer() call to have any
         // effect.
+        #[cfg(feature = "woven_internal_timing")]
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("test"),
+        });
+        #[cfg(not(feature = "woven_internal_timing"))]
         let encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("test"),
         });
-        let command_buffer = encoder.finish();
 
         let item_align = device.limits().min_storage_buffer_offset_alignment as u64;
         let mut abv = AlignedBufferVec::<GpuDummyComposed>::new(
@@ -1226,7 +1252,17 @@ mod gpu_tests {
             ..Default::default()
         });
         assert!(abv.reserve(CAPACITY, &device));
-        assert!(!abv.write_buffer(&device, &queue));
+        #[cfg(feature = "woven_internal_timing")]
+        let mut uploads = ParticleUploadQueue::default();
+        assert!(!abv.write_buffer(
+            &device,
+            &queue,
+            #[cfg(feature = "woven_internal_timing")]
+            &mut uploads,
+        ));
+        #[cfg(feature = "woven_internal_timing")]
+        uploads.flush(&device, &mut encoder, None);
+        let command_buffer = encoder.finish();
         // need a submit() for write_buffer() to be processed
         queue.submit([command_buffer]);
         let (tx, rx) = futures::channel::oneshot::channel();

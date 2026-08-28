@@ -21,6 +21,8 @@ use bevy::{
 };
 use bytemuck::cast_slice;
 
+#[cfg(feature = "woven_internal_timing")]
+use super::ParticleUploadQueue;
 use super::{buffer_table::BufferTableId, BufferBindingSource};
 use crate::{
     asset::EffectAsset,
@@ -249,6 +251,7 @@ impl ParticleSlab {
         capacity: u32,
         particle_layout: ParticleLayout,
         render_device: &RenderDevice,
+        #[cfg(feature = "woven_internal_timing")] uploads: &mut ParticleUploadQueue,
     ) -> Self {
         trace!(
             "ParticleSlab::new(slab_id={}, capacity={}, particle_layout={:?}, item_size={}B)",
@@ -267,9 +270,9 @@ impl ParticleSlab {
 
         // Allocate the particle buffer itself, containing the attributes of each
         // particle.
-        #[cfg(debug_assertions)]
+        #[cfg(all(debug_assertions, not(feature = "woven_internal_timing")))]
         let mapped_at_creation = true;
-        #[cfg(not(debug_assertions))]
+        #[cfg(any(not(debug_assertions), feature = "woven_internal_timing"))]
         let mapped_at_creation = false;
         let particle_capacity_bytes: BufferAddress =
             capacity as u64 * particle_layout.min_binding_size().get();
@@ -281,7 +284,7 @@ impl ParticleSlab {
             mapped_at_creation,
         });
         // Set content
-        #[cfg(debug_assertions)]
+        #[cfg(all(debug_assertions, not(feature = "woven_internal_timing")))]
         {
             // Scope get_mapped_range_mut() to force a drop before unmap()
             {
@@ -294,6 +297,11 @@ impl ParticleSlab {
             }
             particle_buffer.unmap();
         }
+        #[cfg(all(debug_assertions, feature = "woven_internal_timing"))]
+        {
+            let values = vec![0xFFFF_FFFFu32; (particle_capacity_bytes / 4) as usize];
+            uploads.write_buffer(&particle_buffer, 0, cast_slice(&values));
+        }
 
         // Each indirect buffer stores 3 arrays of u32, of length the number of
         // particles.
@@ -303,9 +311,10 @@ impl ParticleSlab {
             label: Some(&indirect_label),
             size: indirect_capacity_bytes,
             usage: BufferUsages::COPY_DST | BufferUsages::STORAGE,
-            mapped_at_creation: true,
+            mapped_at_creation: !cfg!(feature = "woven_internal_timing"),
         });
         // Set content
+        #[cfg(not(feature = "woven_internal_timing"))]
         {
             // Scope get_mapped_range_mut() to force a drop before unmap()
             {
@@ -320,6 +329,14 @@ impl ParticleSlab {
                 mapped.copy_from_slice(cast_slice(values.as_slice()));
             }
             indirect_index_buffer.unmap();
+        }
+        #[cfg(feature = "woven_internal_timing")]
+        {
+            let mut values = vec![0u32; capacity as usize * 3];
+            for index in 0..capacity {
+                values[3 * index as usize + 2] = index;
+            }
+            uploads.write_buffer(&indirect_index_buffer, 0, cast_slice(&values));
         }
 
         // Create the render layout.
@@ -845,6 +862,7 @@ impl EffectCache {
         asset: Handle<EffectAsset>,
         capacity: u32,
         particle_layout: &ParticleLayout,
+        #[cfg(feature = "woven_internal_timing")] uploads: &mut ParticleUploadQueue,
     ) -> CachedEffect {
         trace!("Inserting new effect into cache: capacity={capacity}");
         let (slab_id, slice) = self
@@ -888,6 +906,8 @@ impl EffectCache {
                     capacity,
                     particle_layout.clone(),
                     &self.render_device,
+                    #[cfg(feature = "woven_internal_timing")]
+                    uploads,
                 );
                 let slice_ref = slab.allocate(capacity).unwrap();
                 if index >= self.particle_slabs.len() {
@@ -1355,6 +1375,8 @@ mod gpu_tests {
     fn effect_buffer() {
         let renderer = MockRenderer::new();
         let render_device = renderer.device();
+        #[cfg(feature = "woven_internal_timing")]
+        let mut uploads = ParticleUploadQueue::default();
 
         let l64 = ParticleLayout::new()
             .append(F4A)
@@ -1372,6 +1394,8 @@ mod gpu_tests {
             capacity,
             l64.clone(),
             &render_device,
+            #[cfg(feature = "woven_internal_timing")]
+            &mut uploads,
         );
 
         assert_eq!(buffer.capacity, capacity.max(ParticleSlab::MIN_CAPACITY));
@@ -1427,6 +1451,8 @@ mod gpu_tests {
     fn pop_free_slice() {
         let renderer = MockRenderer::new();
         let render_device = renderer.device();
+        #[cfg(feature = "woven_internal_timing")]
+        let mut uploads = ParticleUploadQueue::default();
 
         let l64 = ParticleLayout::new()
             .append(F4A)
@@ -1445,6 +1471,8 @@ mod gpu_tests {
             capacity,
             l64.clone(),
             &render_device,
+            #[cfg(feature = "woven_internal_timing")]
+            &mut uploads,
         );
 
         let slice0 = buffer.allocate(32);
@@ -1495,6 +1523,8 @@ mod gpu_tests {
     fn effect_cache() {
         let renderer = MockRenderer::new();
         let render_device = renderer.device();
+        #[cfg(feature = "woven_internal_timing")]
+        let mut uploads = ParticleUploadQueue::default();
 
         let l32 = ParticleLayout::new().append(F4A).append(F4B).build();
         assert_eq!(32, l32.size());
@@ -1507,7 +1537,13 @@ mod gpu_tests {
         let item_size = l32.size();
 
         // Insert an effect
-        let effect1 = effect_cache.insert(asset.clone(), capacity, &l32);
+        let effect1 = effect_cache.insert(
+            asset.clone(),
+            capacity,
+            &l32,
+            #[cfg(feature = "woven_internal_timing")]
+            &mut uploads,
+        );
         //assert!(effect1.is_valid());
         let slice1 = &effect1.slice;
         assert_eq!(slice1.len(), capacity);
@@ -1519,7 +1555,13 @@ mod gpu_tests {
         assert_eq!(effect_cache.slabs().len(), 1);
 
         // Insert a second copy of the same effect
-        let effect2 = effect_cache.insert(asset.clone(), capacity, &l32);
+        let effect2 = effect_cache.insert(
+            asset.clone(),
+            capacity,
+            &l32,
+            #[cfg(feature = "woven_internal_timing")]
+            &mut uploads,
+        );
         //assert!(effect2.is_valid());
         let slice2 = &effect2.slice;
         assert_eq!(slice2.len(), capacity);
@@ -1543,7 +1585,13 @@ mod gpu_tests {
         }
 
         // Regression #60
-        let effect3 = effect_cache.insert(asset, capacity, &l32);
+        let effect3 = effect_cache.insert(
+            asset,
+            capacity,
+            &l32,
+            #[cfg(feature = "woven_internal_timing")]
+            &mut uploads,
+        );
         //assert!(effect3.is_valid());
         let slice3 = &effect3.slice;
         assert_eq!(slice3.len(), capacity);

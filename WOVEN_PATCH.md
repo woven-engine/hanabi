@@ -46,13 +46,19 @@ Woven carries seven narrow private seams:
    described above; it is not a pipeline key. Property uploads and render
    binding updates therefore remain live while motion, age, and emission are
    paused on the existing emitter.
-7. `EffectComputeTimestampWrites` accepts one-frame, embedding-owned timestamp
-   intervals for Hanabi's init and update compute-pass descriptors and consumes
-   them before simulation so an old device interval cannot be reused.
-   `ParticleRenderBatch` marks Hanabi's temporary draw entities so Woven can
-   classify particle runs while preserving the existing sorted phase. Hanabi
-   does not allocate queries, resolve raw ticks, aggregate routes, or enforce
-   budgets, and descriptors remain uninstrumented when no interval is supplied.
+7. The `woven_internal_timing` feature exposes only the hidden
+   `woven_private::{ParticleGpuStage, ParticleTiming,
+   ParticleTimingProvider}` seam. Hanabi requests semantic spans for uploads,
+   buffer-growth copies, init-fill, init, indirect dispatch, update prefix,
+   update, optional sort prefix, sort-fill dispatch, and the existing combined
+   sort-fill/sort/sorted-index-copy pass. Woven owns query sets, raw indices,
+   resolution, aggregation, and budgets. With this feature enabled, every
+   Hanabi CPU upload uses one common mapped staging buffer and real
+   command-encoder copies in ordinary Play and capture; capture changes only
+   whether the provider returns timestamp writes. Feature-disabled Hanabi
+   retains its upstream queue-write path. `ParticleRenderBatch` marks Hanabi's
+   temporary draw entities so Woven can classify routed render runs without
+   changing their sorted phase.
 
 The branch also selectively adopts two post-tag correctness fixes without the
 intervening batching, storage, shader-layout, sorting, or feature rewrites:
@@ -67,9 +73,13 @@ endings while adding the matching Spawner fields. That normalization has no
 semantic effect. The seven seams and two fixes above are the complete intentional
 behavior/layout delta from upstream v0.19.0.
 
+The graph-node test imports `Vec3` explicitly so Bevy's unrelated UI `Node`
+type cannot make the graph `Node` trait ambiguous. This is test-only and has no
+production behavior.
+
 These private seams can be removed once upstream exposes equivalent render
 property access, per-instance paused simulation, correct matrix property
 layout behavior, independent material-resource bindings, and observable
 device-pipeline prewarming. The timing seam can be removed once upstream
-accepts embedding-owned descriptor intervals and exposes an equivalent
+exposes equivalent semantic stage hooks, a command-encoder upload path, and
 semantic particle-draw classification.

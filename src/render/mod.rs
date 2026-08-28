@@ -1,3 +1,5 @@
+#[cfg(feature = "woven_internal_timing")]
+use std::sync::Arc;
 use std::{
     borrow::Cow,
     hash::{DefaultHasher, Hash, Hasher},
@@ -106,79 +108,167 @@ pub(crate) use sort::SortBindGroups;
 
 use self::batch::EffectBatch;
 
-/// One query-set interval reserved by an embedding renderer for a Hanabi
-/// compute pass.
-///
-/// Hanabi only attaches this interval to the matching pass descriptor. Query
-/// allocation, resolution, tick conversion, and aggregation remain owned by
-/// the embedding renderer.
-#[derive(Clone, Debug)]
-pub struct EffectTimestampInterval {
-    query_set: wgpu::QuerySet,
-    beginning_of_pass_write_index: u32,
-    end_of_pass_write_index: u32,
+/// Hanabi-owned GPU stages exposed to Woven's private timing provider.
+#[cfg(feature = "woven_internal_timing")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ParticleGpuStage {
+    /// CPU-authored particle data copied through the frame command encoder.
+    Uploads,
+    /// Buffer growth copies recorded before particle simulation.
+    BufferCopies,
+    /// Dispatch-argument fill work for GPU-spawned particle initialization.
+    InitFill,
+    /// Particle initialization dispatches.
+    Init,
+    /// Indirect dispatch and draw-argument preparation.
+    IndirectDispatch,
+    /// Prefix sum used to size update dispatches.
+    UpdatePrefix,
+    /// Particle update dispatches.
+    Update,
+    /// Prefix sum used by optional ribbon sorting.
+    SortPrefix,
+    /// Dispatch-argument fill work for optional ribbon sorting.
+    SortFillDispatch,
+    /// Optional ribbon sort-fill, sort, and sorted-index copy dispatches.
+    SortFillSortAndCopy,
 }
 
-impl EffectTimestampInterval {
-    /// Create an interval from two slots in one timestamp query set.
-    pub fn new(
-        query_set: wgpu::QuerySet,
-        beginning_of_pass_write_index: u32,
-        end_of_pass_write_index: u32,
-    ) -> Self {
-        Self {
-            query_set,
-            beginning_of_pass_write_index,
-            end_of_pass_write_index,
-        }
+/// Feature-gated provider for Woven-owned timestamp reservations.
+///
+/// Hanabi supplies only semantic stages. The provider retains ownership of
+/// query sets, raw query indices, resolution, aggregation, and budget policy.
+#[cfg(feature = "woven_internal_timing")]
+#[doc(hidden)]
+pub trait ParticleTimingProvider: Send + Sync + 'static {
+    /// Return descriptor timestamps for one semantic compute stage.
+    fn compute_pass_writes(
+        &self,
+        stage: ParticleGpuStage,
+    ) -> Option<wgpu::ComputePassTimestampWrites<'_>>;
+
+    /// Write the beginning of one semantic encoder stage.
+    fn begin_encoder_stage(&self, stage: ParticleGpuStage, encoder: &mut wgpu::CommandEncoder);
+
+    /// Write the end of one semantic encoder stage.
+    fn end_encoder_stage(&self, stage: ParticleGpuStage, encoder: &mut wgpu::CommandEncoder);
+}
+
+/// Semantic timing provider installed by Woven's render world.
+#[cfg(feature = "woven_internal_timing")]
+#[doc(hidden)]
+#[derive(Resource, Clone)]
+pub struct ParticleTiming(Arc<dyn ParticleTimingProvider>);
+
+#[cfg(feature = "woven_internal_timing")]
+impl ParticleTiming {
+    /// Install Woven's semantic timing provider.
+    pub fn new(provider: Arc<dyn ParticleTimingProvider>) -> Self {
+        Self(provider)
     }
 
-    fn writes(&self) -> wgpu::ComputePassTimestampWrites<'_> {
-        wgpu::ComputePassTimestampWrites {
-            query_set: &self.query_set,
-            beginning_of_pass_write_index: Some(self.beginning_of_pass_write_index),
-            end_of_pass_write_index: Some(self.end_of_pass_write_index),
-        }
+    fn compute_pass_writes(
+        &self,
+        stage: ParticleGpuStage,
+    ) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+        self.0.compute_pass_writes(stage)
+    }
+
+    fn begin_encoder_stage(&self, stage: ParticleGpuStage, encoder: &mut wgpu::CommandEncoder) {
+        self.0.begin_encoder_stage(stage, encoder);
+    }
+
+    fn end_encoder_stage(&self, stage: ParticleGpuStage, encoder: &mut wgpu::CommandEncoder) {
+        self.0.end_encoder_stage(stage, encoder);
     }
 }
 
-/// One-frame descriptor intervals supplied by an embedding renderer for the
-/// Hanabi-owned particle init and update compute passes.
-///
-/// The intervals are consumed at the beginning of Hanabi simulation, so a
-/// skipped frame or device recreation cannot accidentally reuse an old query
-/// set. Leaving either interval absent preserves the ordinary uninstrumented
-/// pass descriptor.
+#[cfg(feature = "woven_internal_timing")]
+struct PendingParticleUpload {
+    target: Buffer,
+    target_offset: u64,
+    bytes: Vec<u8>,
+}
+
+#[cfg(feature = "woven_internal_timing")]
 #[derive(Resource, Default)]
-pub struct EffectComputeTimestampWrites {
-    init: Option<EffectTimestampInterval>,
-    update: Option<EffectTimestampInterval>,
+pub(crate) struct ParticleUploadQueue {
+    pending: Vec<PendingParticleUpload>,
 }
 
-impl EffectComputeTimestampWrites {
-    /// Replace the intervals that Hanabi will consume during its next frame.
-    pub fn set(
-        &mut self,
-        init: Option<EffectTimestampInterval>,
-        update: Option<EffectTimestampInterval>,
-    ) {
-        self.init = init;
-        self.update = update;
+#[cfg(feature = "woven_internal_timing")]
+impl ParticleUploadQueue {
+    pub(crate) fn write_buffer(&mut self, target: &Buffer, target_offset: u64, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        assert!(
+            target_offset.is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT),
+            "Particle upload target offset must satisfy COPY_BUFFER_ALIGNMENT."
+        );
+        assert!(
+            (bytes.len() as u64).is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT),
+            "Particle upload size must satisfy COPY_BUFFER_ALIGNMENT."
+        );
+        self.pending.push(PendingParticleUpload {
+            target: target.clone(),
+            target_offset,
+            bytes: bytes.to_vec(),
+        });
     }
 
-    /// Clear any intervals that have not yet been consumed.
-    pub fn clear(&mut self) {
-        self.init = None;
-        self.update = None;
-    }
-
-    fn take(
+    fn flush(
         &mut self,
-    ) -> (
-        Option<EffectTimestampInterval>,
-        Option<EffectTimestampInterval>,
+        render_device: &RenderDevice,
+        encoder: &mut CommandEncoder,
+        timing: Option<&ParticleTiming>,
     ) {
-        (self.init.take(), self.update.take())
+        if self.pending.is_empty() {
+            return;
+        }
+
+        let staging_size = self
+            .pending
+            .iter()
+            .fold(0_u64, |offset, upload| offset + upload.bytes.len() as u64);
+        let staging = render_device.create_buffer(&BufferDescriptor {
+            label: Some("hanabi:buffer:particle_uploads"),
+            size: staging_size,
+            usage: BufferUsages::COPY_SRC,
+            mapped_at_creation: true,
+        });
+        {
+            let mut mapped = staging.slice(..).get_mapped_range_mut();
+            let mut source_offset = 0;
+            for upload in &self.pending {
+                let end = source_offset + upload.bytes.len();
+                mapped
+                    .slice(source_offset..end)
+                    .copy_from_slice(&upload.bytes);
+                source_offset = end;
+            }
+        }
+        staging.unmap();
+
+        if let Some(timing) = timing {
+            timing.begin_encoder_stage(ParticleGpuStage::Uploads, encoder);
+        }
+        let mut source_offset = 0;
+        for upload in self.pending.drain(..) {
+            let size = upload.bytes.len() as u64;
+            encoder.copy_buffer_to_buffer(
+                &staging,
+                source_offset,
+                &upload.target,
+                upload.target_offset,
+                size,
+            );
+            source_offset += size;
+        }
+        if let Some(timing) = timing {
+            timing.end_encoder_stage(ParticleGpuStage::Uploads, encoder);
+        }
     }
 }
 
@@ -1421,14 +1511,24 @@ impl GpuBufferOperations {
 
     /// Finish recording operations for this frame, and schedule buffer writes
     /// to GPU.
-    pub fn end_frame(&mut self, device: &RenderDevice, render_queue: &RenderQueue) {
+    pub fn end_frame(
+        &mut self,
+        device: &RenderDevice,
+        render_queue: &RenderQueue,
+        #[cfg(feature = "woven_internal_timing")] uploads: &mut ParticleUploadQueue,
+    ) {
         assert_eq!(
             self.args_buffer.len(),
             self.queues.iter().fold(0, |len, q| len + q.len())
         );
 
         // Upload to GPU buffer
-        if self.args_buffer.write_buffer(device, render_queue) {
+        if self.args_buffer.write_buffer(
+            device,
+            render_queue,
+            #[cfg(feature = "woven_internal_timing")]
+            uploads,
+        ) {
             self.bind_groups.clear();
         }
     }
@@ -1541,6 +1641,8 @@ impl GpuBufferOperations {
         render_context: &mut RenderContext,
         utils_pipeline: &UtilsPipeline,
         compute_pass_label: Option<&str>,
+        #[cfg(feature = "woven_internal_timing")] timing: Option<&ParticleTiming>,
+        #[cfg(feature = "woven_internal_timing")] timing_stage: ParticleGpuStage,
     ) {
         let queue = &self.queues[index as usize];
         trace!(
@@ -1558,7 +1660,11 @@ impl GpuBufferOperations {
                 .command_encoder()
                 .begin_compute_pass(&ComputePassDescriptor {
                     label: compute_pass_label,
+                    #[cfg(not(feature = "woven_internal_timing"))]
                     timestamp_writes: None,
+                    #[cfg(feature = "woven_internal_timing")]
+                    timestamp_writes: timing
+                        .and_then(|timing| timing.compute_pass_writes(timing_stage)),
                 });
 
         let mut prev_op = None;
@@ -3090,7 +3196,10 @@ pub struct EffectsMeta {
     indirect_spawner_bind_group: Option<BindGroup>,
     /// Global shared GPU uniform buffer storing the simulation parameters,
     /// uploaded each frame from CPU to GPU.
+    #[cfg(not(feature = "woven_internal_timing"))]
     sim_params_uniforms: UniformBuffer<GpuSimParams>,
+    #[cfg(feature = "woven_internal_timing")]
+    sim_params_uniforms: AlignedBufferVec<GpuSimParams>,
     /// Global shared GPU buffer storing the various spawner parameter structs
     /// for the active effect instances.
     // Note: we're still binding individual spawners in vfx_sort_fill.
@@ -3111,7 +3220,10 @@ pub struct EffectsMeta {
     /// Debug: was begin_batch() called without end_batch()?
     is_batch_open: bool,
     /// Buffer containing the prefix sums for all batches.
+    #[cfg(not(feature = "woven_internal_timing"))]
     prefix_sum_buffer: BufferVec<u32>,
+    #[cfg(feature = "woven_internal_timing")]
+    prefix_sum_buffer: AlignedBufferVec<u32>,
     /// Global shared GPU buffer storing the various `EffectMetadata`
     /// structs for the active effect instances.
     effect_metadata_buffer: BufferTable<GpuEffectMetadata>,
@@ -3150,8 +3262,16 @@ impl EffectsMeta {
             item_align.get()
         );
 
+        #[cfg(not(feature = "woven_internal_timing"))]
         let mut prefix_sum_buffer = BufferVec::new(BufferUsages::STORAGE);
+        #[cfg(not(feature = "woven_internal_timing"))]
         prefix_sum_buffer.set_label(Some("prefix_sum_buffer"));
+        #[cfg(feature = "woven_internal_timing")]
+        let prefix_sum_buffer = AlignedBufferVec::new(
+            BufferUsages::STORAGE,
+            None,
+            Some("prefix_sum_buffer".to_string()),
+        );
 
         Self {
             view_bind_group: None,
@@ -3159,7 +3279,14 @@ impl EffectsMeta {
             init_and_indirect_sim_params_bind_group: None,
             indirect_metadata_bind_group: None,
             indirect_spawner_bind_group: None,
+            #[cfg(not(feature = "woven_internal_timing"))]
             sim_params_uniforms: UniformBuffer::default(),
+            #[cfg(feature = "woven_internal_timing")]
+            sim_params_uniforms: AlignedBufferVec::new(
+                BufferUsages::UNIFORM,
+                None,
+                Some("hanabi:buffer:sim_params".to_string()),
+            ),
             spawner_buffer: AlignedBufferVec::new(
                 BufferUsages::STORAGE,
                 Some(item_align.into()),
@@ -3510,6 +3637,7 @@ pub fn allocate_effects(
         Changed<ExtractedEffect>,
     >,
     mut effect_cache: ResMut<EffectCache>,
+    #[cfg(feature = "woven_internal_timing")] mut uploads: ResMut<ParticleUploadQueue>,
 ) {
     #[cfg(feature = "trace")]
     let _span = bevy::log::info_span!("allocate_effects").entered();
@@ -3533,6 +3661,8 @@ pub fn allocate_effects(
                 extracted_effect.handle.clone(),
                 allocation_capacity,
                 &extracted_effect.particle_layout,
+                #[cfg(feature = "woven_internal_timing")]
+                &mut uploads,
             );
         } else {
             trace!("Allocating new entry in EffectCache for entity {entity:?}...");
@@ -3540,6 +3670,8 @@ pub fn allocate_effects(
                 extracted_effect.handle.clone(),
                 allocation_capacity,
                 &extracted_effect.particle_layout,
+                #[cfg(feature = "woven_internal_timing")]
+                &mut uploads,
             );
             commands.entity(entity).insert(cached_effect);
         }
@@ -4727,7 +4859,13 @@ pub(crate) fn prepare_batch_inputs(
             gpu_sim_params.real_delta_time,
             gpu_sim_params.num_effects,
         );
+        #[cfg(not(feature = "woven_internal_timing"))]
         effects_meta.sim_params_uniforms.set(gpu_sim_params);
+        #[cfg(feature = "woven_internal_timing")]
+        {
+            effects_meta.sim_params_uniforms.clear();
+            effects_meta.sim_params_uniforms.push(gpu_sim_params);
+        }
     }
 }
 
@@ -4740,6 +4878,7 @@ pub(crate) fn prepare_batch_inputs(
 pub(crate) fn batch_effects(
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
+    #[cfg(feature = "woven_internal_timing")] mut uploads: ResMut<ParticleUploadQueue>,
     mut commands: Commands,
     mut effects_meta: ResMut<EffectsMeta>,
     mut sort_bind_groups: ResMut<SortBindGroups>,
@@ -4921,10 +5060,12 @@ pub(crate) fn batch_effects(
     debug_assert!(sorted_effect_batches.dispatch_queue_index.is_none());
 
     // Write the entire spawner buffer for this frame, for all effects combined
-    if effects_meta
-        .spawner_buffer
-        .write_buffer(&render_device, &render_queue)
-    {
+    if effects_meta.spawner_buffer.write_buffer(
+        &render_device,
+        &render_queue,
+        #[cfg(feature = "woven_internal_timing")]
+        &mut uploads,
+    ) {
         // All property bind groups use the spawner buffer, which was reallocate
         effect_bind_groups.particle_slabs.clear();
         property_bind_groups.clear(true);
@@ -4932,10 +5073,12 @@ pub(crate) fn batch_effects(
     }
 
     // Write the entire batch info buffer for this frame, for all batches combined
-    if effects_meta
-        .batch_info_buffer
-        .write_buffer(&render_device, &render_queue)
-    {
+    if effects_meta.batch_info_buffer.write_buffer(
+        &render_device,
+        &render_queue,
+        #[cfg(feature = "woven_internal_timing")]
+        &mut uploads,
+    ) {
         // All property bind groups use the spawner buffer, which was reallocate
         effect_bind_groups.particle_slabs.clear();
         property_bind_groups.clear(true);
@@ -4949,7 +5092,7 @@ pub(crate) fn batch_effects(
         if cpu_len > 0 {
             let gpu_capacity = effects_meta.prefix_sum_buffer.capacity();
             if cpu_len > gpu_capacity {
-                effects_meta
+                let _ = effects_meta
                     .prefix_sum_buffer
                     .reserve(cpu_len, &render_device);
 
@@ -4961,9 +5104,12 @@ pub(crate) fn batch_effects(
                 effects_meta.prefix_sum_bind_group = None;
             }
             assert!(effects_meta.prefix_sum_buffer.buffer().is_some());
-            effects_meta
-                .prefix_sum_buffer
-                .write_buffer(&render_device, &render_queue);
+            let _ = effects_meta.prefix_sum_buffer.write_buffer(
+                &render_device,
+                &render_queue,
+                #[cfg(feature = "woven_internal_timing")]
+                &mut uploads,
+            );
         }
     }
 }
@@ -6231,6 +6377,7 @@ pub(crate) fn prepare_gpu_resources(
     mut sort_bind_groups: ResMut<SortBindGroups>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
+    #[cfg(feature = "woven_internal_timing")] mut uploads: ResMut<ParticleUploadQueue>,
     view_uniforms: Res<ViewUniforms>,
     render_pipeline: Res<ParticlesRenderPipeline>,
     pipeline_cache: Res<PipelineCache>,
@@ -6244,9 +6391,12 @@ pub(crate) fn prepare_gpu_resources(
 
     // Upload simulation parameters for this frame
     let prev_buffer_id = effects_meta.sim_params_uniforms.buffer().map(|b| b.id());
-    effects_meta
-        .sim_params_uniforms
-        .write_buffer(&render_device, &render_queue);
+    let _ = effects_meta.sim_params_uniforms.write_buffer(
+        &render_device,
+        &render_queue,
+        #[cfg(feature = "woven_internal_timing")]
+        &mut uploads,
+    );
     if prev_buffer_id != effects_meta.sim_params_uniforms.buffer().map(|b| b.id()) {
         // Buffer changed, invalidate bind groups
         effects_meta.update_sim_params_bind_group = None;
@@ -6265,10 +6415,12 @@ pub(crate) fn prepare_gpu_resources(
     ));
 
     // Re-/allocate the draw indirect args buffer if needed
-    if effects_meta
-        .draw_indirect_buffer
-        .allocate_gpu(&render_device, &render_queue)
-    {
+    if effects_meta.draw_indirect_buffer.allocate_gpu(
+        &render_device,
+        &render_queue,
+        #[cfg(feature = "woven_internal_timing")]
+        &mut uploads,
+    ) {
         // All those bind groups use the buffer so need to be re-created
         trace!("*** Draw indirect args buffer re-allocated; clearing all bind groups using it.");
         effects_meta.update_sim_params_bind_group = None;
@@ -6278,7 +6430,13 @@ pub(crate) fn prepare_gpu_resources(
     // Re-/allocate any GPU buffer if needed
     //effect_cache.prepare_buffers(&render_device, &render_queue, &mut
     // effect_bind_groups);
-    event_cache.prepare_buffers(&render_device, &render_queue, &mut effect_bind_groups);
+    event_cache.prepare_buffers(
+        &render_device,
+        &render_queue,
+        #[cfg(feature = "woven_internal_timing")]
+        &mut uploads,
+        &mut effect_bind_groups,
+    );
     sort_bind_groups.prepare_buffers(&render_device);
     if effects_meta
         .dispatch_indirect_buffer
@@ -6300,6 +6458,7 @@ pub(crate) fn prepare_gpu_resources(
 pub(crate) fn prepare_effect_metadata(
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
+    #[cfg(feature = "woven_internal_timing")] mut uploads: ResMut<ParticleUploadQueue>,
     mut q_effects: Query<(
         MainEntity,
         Ref<ExtractedEffect>,
@@ -6450,10 +6609,12 @@ pub(crate) fn prepare_effect_metadata(
     }
 
     // Once all EffectMetadata values are written, schedule a GPU upload
-    if effects_meta
-        .effect_metadata_buffer
-        .allocate_gpu(render_device.as_ref(), render_queue.as_ref())
-    {
+    if effects_meta.effect_metadata_buffer.allocate_gpu(
+        render_device.as_ref(),
+        render_queue.as_ref(),
+        #[cfg(feature = "woven_internal_timing")]
+        &mut uploads,
+    ) {
         // All those bind groups use the buffer so need to be re-created
         trace!("*** Effect metadata buffer re-allocated; clearing all bind groups using it.");
         effects_meta.indirect_metadata_bind_group = None;
@@ -6501,6 +6662,7 @@ pub(crate) fn queue_init_fill_dispatch_ops(
     event_cache: Res<EventCache>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
+    #[cfg(feature = "woven_internal_timing")] mut uploads: ResMut<ParticleUploadQueue>,
     mut init_fill_dispatch_queue: ResMut<InitFillDispatchQueue>,
     mut gpu_buffer_operations: ResMut<GpuBufferOperations>,
 ) {
@@ -6525,7 +6687,12 @@ pub(crate) fn queue_init_fill_dispatch_ops(
     // queue_sort_fill_dispatch_ops() is ordered before this system,
     // the init submit is just above). See begin_frame() in batch_effects() for the
     // full lifecycle.
-    gpu_buffer_operations.end_frame(&render_device, &render_queue);
+    gpu_buffer_operations.end_frame(
+        &render_device,
+        &render_queue,
+        #[cfg(feature = "woven_internal_timing")]
+        &mut uploads,
+    );
 }
 
 #[derive(SystemParam)]
@@ -7307,20 +7474,26 @@ fn begin_hanabi_compute_pass<'encoder>(
     label: &str,
     pipeline_cache: &'encoder PipelineCache,
     render_context: &'encoder mut RenderContext,
-    timestamp_interval: Option<&'encoder EffectTimestampInterval>,
+    #[cfg(feature = "woven_internal_timing")] timing: Option<&'encoder ParticleTiming>,
+    #[cfg(feature = "woven_internal_timing")] timing_stage: ParticleGpuStage,
 ) -> HanabiComputePass<'encoder> {
     let compute_pass =
         render_context
             .command_encoder()
             .begin_compute_pass(&ComputePassDescriptor {
                 label: Some(label),
-                timestamp_writes: timestamp_interval.map(EffectTimestampInterval::writes),
+                #[cfg(not(feature = "woven_internal_timing"))]
+                timestamp_writes: None,
+                #[cfg(feature = "woven_internal_timing")]
+                timestamp_writes: timing
+                    .and_then(|timing| timing.compute_pass_writes(timing_stage)),
             });
     HanabiComputePass::new(pipeline_cache, compute_pass)
 }
 
 fn simulate(
     mut render_context: RenderContext,
+    #[cfg(feature = "woven_internal_timing")] render_device: Res<RenderDevice>,
     pipeline_cache: Res<PipelineCache>,
     effects_meta: Res<EffectsMeta>,
     effect_bind_groups: Res<EffectBindGroups>,
@@ -7332,18 +7505,34 @@ fn simulate(
     gpu_buffer_operations: Res<GpuBufferOperations>,
     sorted_effect_batches: Res<SortedEffectBatches>,
     init_fill_dispatch_queue: Res<InitFillDispatchQueue>,
-    timestamp_writes: Option<ResMut<EffectComputeTimestampWrites>>,
+    #[cfg(feature = "woven_internal_timing")] timing: Option<Res<ParticleTiming>>,
+    #[cfg(feature = "woven_internal_timing")] mut uploads: ResMut<ParticleUploadQueue>,
 ) {
     trace!("simulate()");
 
-    let (init_timestamp_interval, update_timestamp_interval) = timestamp_writes
-        .map(|mut writes| writes.take())
-        .unwrap_or_default();
+    #[cfg(feature = "woven_internal_timing")]
+    uploads.flush(
+        &render_device,
+        render_context.command_encoder(),
+        timing.as_deref(),
+    );
 
     // Make sure to schedule any buffer copy before accessing their content later in
     // the GPU commands below.
     {
         let command_encoder = render_context.command_encoder();
+        #[cfg(feature = "woven_internal_timing")]
+        let has_buffer_copies = effects_meta.dispatch_indirect_buffer.has_pending_copy()
+            || effects_meta.draw_indirect_buffer.has_pending_copy()
+            || effects_meta.effect_metadata_buffer.has_pending_copy()
+            || event_cache.has_pending_copy()
+            || sort_bind_groups.has_pending_copy();
+        #[cfg(feature = "woven_internal_timing")]
+        if has_buffer_copies {
+            if let Some(timing) = timing.as_deref() {
+                timing.begin_encoder_stage(ParticleGpuStage::BufferCopies, command_encoder);
+            }
+        }
         effects_meta
             .dispatch_indirect_buffer
             .write_buffers(command_encoder);
@@ -7355,6 +7544,12 @@ fn simulate(
             .write_buffer(command_encoder);
         event_cache.write_buffers(command_encoder);
         sort_bind_groups.write_buffers(command_encoder);
+        #[cfg(feature = "woven_internal_timing")]
+        if has_buffer_copies {
+            if let Some(timing) = timing.as_deref() {
+                timing.end_encoder_stage(ParticleGpuStage::BufferCopies, command_encoder);
+            }
+        }
     }
 
     // Compute init fill dispatch pass - Fill the indirect dispatch structs for any
@@ -7366,6 +7561,10 @@ fn simulate(
             &mut render_context,
             &utils_pipeline,
             Some("hanabi:init_indirect_fill_dispatch"),
+            #[cfg(feature = "woven_internal_timing")]
+            timing.as_deref(),
+            #[cfg(feature = "woven_internal_timing")]
+            ParticleGpuStage::InitFill,
         );
     }
 
@@ -7414,7 +7613,10 @@ fn simulate(
             "hanabi:init",
             &pipeline_cache,
             &mut render_context,
-            init_timestamp_interval.as_ref(),
+            #[cfg(feature = "woven_internal_timing")]
+            timing.as_deref(),
+            #[cfg(feature = "woven_internal_timing")]
+            ParticleGpuStage::Init,
         );
 
         // Bind group simparams@0 is common to everything, only set once per init pass
@@ -7575,7 +7777,10 @@ fn simulate(
             "hanabi:indirect_dispatch",
             &pipeline_cache,
             &mut render_context,
-            None,
+            #[cfg(feature = "woven_internal_timing")]
+            timing.as_deref(),
+            #[cfg(feature = "woven_internal_timing")]
+            ParticleGpuStage::IndirectDispatch,
         );
 
         // Dispatch indirect dispatch compute job
@@ -7637,7 +7842,10 @@ fn simulate(
             "hanabi:update_prefix_sum",
             &pipeline_cache,
             &mut render_context,
-            None,
+            #[cfg(feature = "woven_internal_timing")]
+            timing.as_deref(),
+            #[cfg(feature = "woven_internal_timing")]
+            ParticleGpuStage::UpdatePrefix,
         );
 
         trace!("record commands for update prefix sum pipeline...");
@@ -7675,7 +7883,10 @@ fn simulate(
             "hanabi:update",
             &pipeline_cache,
             &mut render_context,
-            update_timestamp_interval.as_ref(),
+            #[cfg(feature = "woven_internal_timing")]
+            timing.as_deref(),
+            #[cfg(feature = "woven_internal_timing")]
+            ParticleGpuStage::Update,
         );
 
         // Bind group simparams@0 is common to everything, only set once per update pass
@@ -7794,7 +8005,10 @@ fn simulate(
                 "hanabi:sort_prefix_sum",
                 &pipeline_cache,
                 &mut render_context,
-                None,
+                #[cfg(feature = "woven_internal_timing")]
+                timing.as_deref(),
+                #[cfg(feature = "woven_internal_timing")]
+                ParticleGpuStage::SortPrefix,
             );
 
             trace!("record commands for sort prefix sum pass...");
@@ -7837,6 +8051,10 @@ fn simulate(
                 &mut render_context,
                 &utils_pipeline,
                 Some("hanabi:sort_fill_dispatch"),
+                #[cfg(feature = "woven_internal_timing")]
+                timing.as_deref(),
+                #[cfg(feature = "woven_internal_timing")]
+                ParticleGpuStage::SortFillDispatch,
             );
         }
 
@@ -7846,7 +8064,10 @@ fn simulate(
                 "hanabi:sort",
                 &pipeline_cache,
                 &mut render_context,
-                None,
+                #[cfg(feature = "woven_internal_timing")]
+                timing.as_deref(),
+                #[cfg(feature = "woven_internal_timing")]
+                ParticleGpuStage::SortFillSortAndCopy,
             );
 
             let effect_metadata_buffer = effects_meta.effect_metadata_buffer.buffer().unwrap();
@@ -8054,43 +8275,114 @@ mod tests {
         assert!(world.entity(entity).contains::<ParticleRenderBatch>());
     }
 
-    #[cfg(feature = "gpu_tests")]
+    #[cfg(feature = "woven_internal_timing")]
     #[test]
-    fn effect_timestamp_intervals_are_consumed_once() {
+    fn particle_timing_requests_only_semantic_stages() {
+        use std::sync::Mutex;
+
+        struct RecordingProvider(Arc<Mutex<Vec<ParticleGpuStage>>>);
+
+        impl ParticleTimingProvider for RecordingProvider {
+            fn compute_pass_writes(
+                &self,
+                stage: ParticleGpuStage,
+            ) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+                self.0.lock().unwrap().push(stage);
+                None
+            }
+
+            fn begin_encoder_stage(
+                &self,
+                _stage: ParticleGpuStage,
+                _encoder: &mut wgpu::CommandEncoder,
+            ) {
+            }
+
+            fn end_encoder_stage(
+                &self,
+                _stage: ParticleGpuStage,
+                _encoder: &mut wgpu::CommandEncoder,
+            ) {
+            }
+        }
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let timing = ParticleTiming::new(Arc::new(RecordingProvider(observed.clone())));
+        assert!(timing
+            .compute_pass_writes(ParticleGpuStage::IndirectDispatch)
+            .is_none());
+        assert!(timing
+            .compute_pass_writes(ParticleGpuStage::SortFillSortAndCopy)
+            .is_none());
+        assert_eq!(
+            *observed.lock().unwrap(),
+            [
+                ParticleGpuStage::IndirectDispatch,
+                ParticleGpuStage::SortFillSortAndCopy,
+            ]
+        );
+    }
+
+    #[cfg(all(feature = "woven_internal_timing", feature = "gpu_tests"))]
+    #[test]
+    fn particle_uploads_share_one_semantic_encoder_scope() {
+        use std::sync::Mutex;
+
         use crate::test_utils::MockRenderer;
 
-        let renderer = MockRenderer::new();
-        let query_set =
-            renderer
-                .device()
-                .wgpu_device()
-                .create_query_set(&wgpu::QuerySetDescriptor {
-                    // This test exercises only interval ownership and descriptor
-                    // construction. The mock device intentionally does not request
-                    // timestamp capability; Woven's physical suite supplies and
-                    // resolves real timestamp query sets.
-                    label: Some("hanabi-test-interval-storage"),
-                    ty: wgpu::QueryType::Occlusion,
-                    count: 4,
-                });
-        let mut supplied = EffectComputeTimestampWrites::default();
-        supplied.set(
-            Some(EffectTimestampInterval::new(query_set.clone(), 0, 1)),
-            Some(EffectTimestampInterval::new(query_set.clone(), 2, 3)),
-        );
+        struct RecordingProvider(Arc<Mutex<Vec<(&'static str, ParticleGpuStage)>>>);
 
-        let (init, update) = supplied.take();
-        let init = init.expect("init interval");
-        let update = update.expect("update interval");
-        let init_writes = init.writes();
-        let update_writes = update.writes();
-        assert_eq!(init_writes.query_set, &query_set);
-        assert_eq!(init_writes.beginning_of_pass_write_index, Some(0));
-        assert_eq!(init_writes.end_of_pass_write_index, Some(1));
-        assert_eq!(update_writes.query_set, &query_set);
-        assert_eq!(update_writes.beginning_of_pass_write_index, Some(2));
-        assert_eq!(update_writes.end_of_pass_write_index, Some(3));
-        assert!(matches!(supplied.take(), (None, None)));
+        impl ParticleTimingProvider for RecordingProvider {
+            fn compute_pass_writes(
+                &self,
+                _stage: ParticleGpuStage,
+            ) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+                None
+            }
+
+            fn begin_encoder_stage(
+                &self,
+                stage: ParticleGpuStage,
+                _encoder: &mut wgpu::CommandEncoder,
+            ) {
+                self.0.lock().unwrap().push(("begin", stage));
+            }
+
+            fn end_encoder_stage(
+                &self,
+                stage: ParticleGpuStage,
+                _encoder: &mut wgpu::CommandEncoder,
+            ) {
+                self.0.lock().unwrap().push(("end", stage));
+            }
+        }
+
+        let renderer = MockRenderer::new();
+        let device = renderer.device();
+        let target = device.create_buffer(&BufferDescriptor {
+            label: Some("particle upload semantic scope test"),
+            size: 8,
+            usage: BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let timing = ParticleTiming::new(Arc::new(RecordingProvider(observed.clone())));
+        let mut uploads = ParticleUploadQueue::default();
+        uploads.write_buffer(&target, 0, &[1, 2, 3, 4]);
+        uploads.write_buffer(&target, 4, &[5, 6, 7, 8]);
+        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("particle upload semantic scope test"),
+        });
+        uploads.flush(&device, &mut encoder, Some(&timing));
+        let _ = encoder.finish();
+
+        assert_eq!(
+            *observed.lock().unwrap(),
+            [
+                ("begin", ParticleGpuStage::Uploads),
+                ("end", ParticleGpuStage::Uploads),
+            ]
+        );
     }
 
     #[cfg(feature = "gpu_tests")]
@@ -8114,6 +8406,8 @@ mod tests {
         let renderer = MockRenderer::new();
         let device = renderer.device();
         let render_queue = renderer.queue();
+        #[cfg(feature = "woven_internal_timing")]
+        let mut uploads = ParticleUploadQueue::default();
 
         let mut world = World::new();
         world.insert_resource(device.clone());
@@ -8146,7 +8440,12 @@ mod tests {
             q.submit(&src_buffer, &dst_buffer, &mut buffer_ops);
             assert_eq!(buffer_ops.args_buffer.len(), 1);
         }
-        buffer_ops.end_frame(&device, &render_queue);
+        buffer_ops.end_frame(
+            &device,
+            &render_queue,
+            #[cfg(feature = "woven_internal_timing")]
+            &mut uploads,
+        );
 
         // Even if out of order, the init fill dispatch ops are batchable. Here the
         // offsets are enqueued inverted.
@@ -8162,7 +8461,12 @@ mod tests {
             q.submit(&src_buffer, &dst_buffer, &mut buffer_ops);
             assert_eq!(buffer_ops.args_buffer.len(), 1);
         }
-        buffer_ops.end_frame(&device, &render_queue);
+        buffer_ops.end_frame(
+            &device,
+            &render_queue,
+            #[cfg(feature = "woven_internal_timing")]
+            &mut uploads,
+        );
 
         // However, both the source and destination need to be contiguous at the same
         // time. Here they are mixed so we can't batch.
@@ -8178,6 +8482,11 @@ mod tests {
             q.submit(&src_buffer, &dst_buffer, &mut buffer_ops);
             assert_eq!(buffer_ops.args_buffer.len(), 2);
         }
-        buffer_ops.end_frame(&device, &render_queue);
+        buffer_ops.end_frame(
+            &device,
+            &render_queue,
+            #[cfg(feature = "woven_internal_timing")]
+            &mut uploads,
+        );
     }
 }

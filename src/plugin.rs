@@ -22,6 +22,8 @@ use bevy::{
 };
 
 use crate::asset::EffectAssetLoader;
+#[cfg(feature = "woven_internal_timing")]
+use crate::render::ParticleUploadQueue;
 use crate::{
     asset::{DefaultMesh, EffectAsset},
     compile_effects,
@@ -360,6 +362,8 @@ impl Plugin for HanabiPlugin {
         let event_cache = EventCache::new(render_device);
 
         let render_app = app.sub_app_mut(RenderApp);
+        #[cfg(feature = "woven_internal_timing")]
+        render_app.init_resource::<ParticleUploadQueue>();
         let sort_bind_groups = SortBindGroups::new(
             render_app.world_mut(),
             sort_fill_shader,

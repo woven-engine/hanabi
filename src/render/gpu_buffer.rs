@@ -356,4 +356,9 @@ impl<T: Pod + ShaderType + ShaderSize> GpuBuffer<T> {
             old_buffer.buffer.destroy();
         }
     }
+
+    #[cfg(feature = "woven_internal_timing")]
+    pub fn has_pending_copy(&self) -> bool {
+        self.old_buffer.is_some()
+    }
 }
