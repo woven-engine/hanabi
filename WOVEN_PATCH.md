@@ -6,7 +6,7 @@ object `ae3bc5fc18e89ab619cb035a0475f9b1335ce897`). The Git ancestry records tha
 base directly. Upstream licenses the source as MIT OR Apache-2.0; the
 unmodified `LICENSE-MIT` and `LICENSE-APACHE2` files remain authoritative.
 
-Woven carries seven narrow private seams:
+Woven carries eight narrow private seams:
 
 1. The already allocated per-instance `properties_array_index` is copied into
    `GpuSpawnerParams` and the WGSL `Spawner`, then installed in the private
@@ -60,6 +60,11 @@ Woven carries seven narrow private seams:
    queue-write and encoder-copy paths. `ParticleRenderBatch` marks Hanabi's
    temporary draw entities so Woven can classify routed render runs without
    changing their sorted phase.
+8. The utility compute shader module uses the diagnostic label
+   `hanabi_shader_utils`. DXC receives shader-module labels as source filenames
+   and rejects the former colon-delimited `hanabi:shader:utils` label on Windows.
+   This changes no WGSL source, Bevy shader import path, pipeline key, or
+   particle behavior; other labels remain intact for diagnostics.
 
 The branch also selectively adopts two post-tag correctness fixes without the
 intervening batching, storage, shader-layout, sorting, or feature rewrites:
@@ -71,7 +76,7 @@ intervening batching, storage, shader-layout, sorting, or feature rewrites:
 
 The copied `vfx_common.wgsl` mechanically normalizes its upstream CRLF line
 endings while adding the matching Spawner fields. That normalization has no
-semantic effect. The seven seams and two fixes above are the complete intentional
+semantic effect. The eight seams and two fixes above are the complete intentional
 behavior/layout delta from upstream v0.19.0.
 
 The graph-node test imports `Vec3` explicitly so Bevy's unrelated UI `Node`

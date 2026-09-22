@@ -1971,7 +1971,9 @@ impl FromWorld for UtilsPipeline {
         #[allow(unsafe_code)]
         let shader_module = unsafe {
             render_device.create_shader_module(ShaderModuleDescriptor {
-                label: Some("hanabi:shader:utils"),
+                // DXC treats shader-module labels as HLSL source filenames. A colon
+                // here is parsed as a drive separator and rejects this module.
+                label: Some("hanabi_shader_utils"),
                 source: shader_source,
             })
         };
