@@ -74,10 +74,19 @@ intervening batching, storage, shader-layout, sorting, or feature rewrites:
 - `5fab912`: the cached-event observer is the sole owner of event-buffer free,
   and metadata bind groups are invalidated when that buffer changes.
 
+It also carries one Woven-authored correctness fix. In v0.19.0, image
+`Modified` and `Removed` events evict only the per-image bind group cache, never
+the material bind groups cached per set of image ids. Each removed image then
+stays resident through its cached material bind group, and a modified image keeps
+drawing its previous texture; an effect whose texture alternates between assets
+retains one bind group and one GPU texture per reload. Both events now evict every
+cached bind group that binds the image.
+
 The copied `vfx_common.wgsl` mechanically normalizes its upstream CRLF line
 endings while adding the matching Spawner fields. That normalization has no
-semantic effect. The eight seams and two fixes above are the complete intentional
-behavior/layout delta from upstream v0.19.0.
+semantic effect. The eight seams, two adopted fixes, and the material bind group
+eviction above are the complete intentional behavior/layout delta from upstream
+v0.19.0.
 
 The graph-node test imports `Vec3` explicitly so Bevy's unrelated UI `Node`
 type cannot make the graph `Node` trait ambiguous. This is test-only and has no
