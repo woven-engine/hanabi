@@ -5522,6 +5522,15 @@ pub struct EffectBindGroups {
 }
 
 impl EffectBindGroups {
+    /// Drops every cached bind group that binds image `id`. A modified image
+    /// has a new GPU texture under the same id, and a removed image must not
+    /// stay resident through a cached material that will never draw again.
+    fn invalidate_image(&mut self, id: AssetId<Image>) {
+        self.images.remove(&id);
+        self.material_bind_groups
+            .retain(|material, _| !material.textures.contains(&id));
+    }
+
     pub fn particle_render(&self, slab_id: &SlabId) -> Option<&BindGroup> {
         self.particle_slabs.get(slab_id).map(|bg| &bg.render)
     }
@@ -6230,15 +6239,8 @@ pub(crate) fn queue_effects(
             AssetEvent::Added { .. } => (),
             AssetEvent::LoadedWithDependencies { .. } => (),
             AssetEvent::Unused { .. } => (),
-            AssetEvent::Modified { id } => {
-                if effect_bind_groups.images.remove(id).is_some() {
-                    trace!("Destroyed bind group of modified image asset {:?}", id);
-                }
-            }
-            AssetEvent::Removed { id } => {
-                if effect_bind_groups.images.remove(id).is_some() {
-                    trace!("Destroyes bind group of removed image asset {:?}", id);
-                }
+            AssetEvent::Modified { id } | AssetEvent::Removed { id } => {
+                effect_bind_groups.invalidate_image(*id);
             }
         };
     }
@@ -8486,6 +8488,51 @@ mod tests {
                 ParticleGpuStage::SortFillSortAndCopy,
             ]
         );
+    }
+
+    #[cfg(feature = "gpu_tests")]
+    #[test]
+    fn invalidated_images_release_their_material_bind_groups() {
+        use bevy::asset::uuid::Uuid;
+
+        use crate::test_utils::MockRenderer;
+
+        let renderer = MockRenderer::new();
+        let device = renderer.device();
+        let layout = device.create_bind_group_layout("material invalidation test", &[]);
+        let replaced = AssetId::<Image>::Uuid {
+            uuid: Uuid::from_u128(1),
+        };
+        let kept = AssetId::<Image>::Uuid {
+            uuid: Uuid::from_u128(2),
+        };
+        let material = |id| Material {
+            layout: TextureLayout::default(),
+            textures: vec![id],
+            woven_samplers: Vec::new(),
+        };
+        let mut bind_groups = EffectBindGroups::default();
+        for id in [replaced, kept] {
+            bind_groups.material_bind_groups.insert(
+                material(id),
+                device.create_bind_group("material invalidation test", &layout, &[]),
+            );
+            bind_groups.images.insert(
+                id,
+                device.create_bind_group("material invalidation test", &layout, &[]),
+            );
+        }
+
+        bind_groups.invalidate_image(replaced);
+
+        assert!(!bind_groups
+            .material_bind_groups
+            .contains_key(&material(replaced)));
+        assert!(!bind_groups.images.contains_key(&replaced));
+        assert!(bind_groups
+            .material_bind_groups
+            .contains_key(&material(kept)));
+        assert!(bind_groups.images.contains_key(&kept));
     }
 
     #[cfg(all(feature = "woven_internal_timing", feature = "gpu_tests"))]
